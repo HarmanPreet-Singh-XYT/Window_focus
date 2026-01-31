@@ -1,3 +1,4 @@
+// window_focus_method_channel.dart
 import 'dart:async';
 import 'package:flutter/services.dart';
 import 'domain/domain.dart';
@@ -164,6 +165,29 @@ class WindowFocus{
       'debug': value,
     });
   }
+
+  /// Enables or disables controller/gamepad input monitoring.
+  ///
+  /// When enabled, the plugin will detect input from XInput-compatible controllers
+  /// (Xbox controllers, compatible gamepads) and treat them as user activity.
+  /// This is enabled by default.
+  ///
+  /// - [enabled]: A `bool` that determines whether controller monitoring is enabled (`true`) or disabled (`false`).
+  ///   Default is `true`.
+  ///
+  /// ```dart
+  /// // Enable controller monitoring
+  /// await _windowFocus.setControllerMonitoring(true);
+  ///
+  /// // Disable if you don't want controllers to prevent idle state
+  /// await _windowFocus.setControllerMonitoring(false);
+  /// ```
+  Future<void> setControllerMonitoring(bool enabled) async {
+    await _channel.invokeMethod('setControllerMonitoring', {
+      'enabled': enabled,
+    });
+  }
+
   /// Adds a listener for active window changes.
   ///
   /// The callback is triggered whenever the user switches to a different window.

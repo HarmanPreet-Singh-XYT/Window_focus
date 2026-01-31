@@ -3,10 +3,12 @@
 
 #include <flutter/method_channel.h>
 #include <flutter/plugin_registrar_windows.h>
-
 #include <chrono>
 #include <memory>
 #include <windows.h>
+#include <xinput.h>
+
+#pragma comment(lib, "XInput.lib")
 
 namespace window_focus {
 
@@ -18,7 +20,8 @@ class WindowFocusPlugin : public flutter::Plugin {
   // Конструктор / деструктор
   WindowFocusPlugin();
   virtual ~WindowFocusPlugin();
-    void HandleMethodCall(
+
+  void HandleMethodCall(
       const flutter::MethodCall<flutter::EncodableValue>& method_call,
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 
@@ -30,15 +33,23 @@ class WindowFocusPlugin : public flutter::Plugin {
   // == 2) Статические хуки и статические переменные-хуки.
   static HHOOK keyboardHook_;
   static HHOOK mouseHook_;
+  
   static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
   static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam);
 
   // == 3) Ваши обычные (нестатические) поля
   std::shared_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel;
+  
   bool userIsActive_ = true;
   int inactivityThreshold_ = 1000;
   bool enableDebug_ = false;
+  
   std::chrono::steady_clock::time_point lastActivityTime;
+  
+  // New: For controller/gamepad detection
+  bool monitorControllers_ = true;
+  XINPUT_STATE lastControllerStates_[XUSER_MAX_COUNT];
+  POINT lastMousePosition_;
 
   // == 4) Внутренние методы
   void SetHooks();
@@ -49,12 +60,15 @@ class WindowFocusPlugin : public flutter::Plugin {
 
   // Пример: метод обработки вызовов из Dart
 
-
   // Доп. методы: CheckForInactivity(), StartFocusListener() и т.д. по желанию
-
   void CheckForInactivity();
   void StartFocusListener();
-
+  
+  // New: Controller and input monitoring
+  void MonitorAllInputDevices();
+  bool CheckControllerInput();
+  bool CheckRawInput();
+  
   std::optional<std::vector<uint8_t>> TakeScreenshot(bool activeWindowOnly);
 };
 

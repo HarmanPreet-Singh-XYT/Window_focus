@@ -12,7 +12,7 @@
 #include <flutter/binary_messenger.h>
 #include <flutter/encodable_value.h>
 #include <Windows.h>
-
+#include <xinput.h>
 
 #include <iostream>
 #include <memory>
@@ -29,6 +29,7 @@
 #include <gdiplus.h>
 
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "XInput.lib")
 
 namespace window_focus {
 
@@ -36,11 +37,7 @@ WindowFocusPlugin* WindowFocusPlugin::instance_ = nullptr;
 HHOOK WindowFocusPlugin::keyboardHook_ = nullptr;
 HHOOK WindowFocusPlugin::mouseHook_ = nullptr;
 
-
-
 using CallbackMethod = std::function<void(const std::wstring&)>;
-
-
 
 LRESULT CALLBACK WindowFocusPlugin::KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
   if (nCode == HC_ACTION && instance_) {
@@ -81,9 +78,8 @@ LRESULT CALLBACK WindowFocusPlugin::MouseProc(int nCode, WPARAM wParam, LPARAM l
   return CallNextHookEx(mouseHook_, nCode, wParam, lParam);
 }
 
-
 void WindowFocusPlugin::SetHooks() {
- if (instance_ && instance_->enableDebug_) {
+  if (instance_ && instance_->enableDebug_) {
     std::cout << "[WindowFocus] SetHooks: start\n";
   }
   // Пример: глобальные LL-хуки
@@ -118,10 +114,10 @@ void WindowFocusPlugin::RemoveHooks() {
     mouseHook_ = nullptr;
   }
 }
+
 void WindowFocusPlugin::UpdateLastActivityTime() {
   lastActivityTime = std::chrono::steady_clock::now();
 }
-
 
 std::string ConvertWindows1251ToUTF8(const std::string& windows1251_str) {
     int size_needed = MultiByteToWideChar(1251, 0, windows1251_str.c_str(), -1, NULL, 0);
@@ -134,6 +130,7 @@ std::string ConvertWindows1251ToUTF8(const std::string& windows1251_str) {
 
     return utf8_str;
 }
+
 std::string ConvertWStringToUTF8(const std::wstring& wstr) {
     if (wstr.empty()) {
         return std::string();
@@ -143,9 +140,7 @@ std::string ConvertWStringToUTF8(const std::wstring& wstr) {
     WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
     return strTo;
 }
-/*void WindowFocusPlugin::SetMethodChannel(std::shared_ptr<flutter::MethodChannel<flutter::EncodableValue>> method_channel) {
-    channel = method_channel;
-}*/
+
 // static
 void WindowFocusPlugin::RegisterWithRegistrar(
     flutter::PluginRegistrarWindows* registrar) {
@@ -164,9 +159,9 @@ void WindowFocusPlugin::RegisterWithRegistrar(
   // Если нужно: устанавливаем хуки
   plugin->SetHooks();
 
-    plugin->CheckForInactivity();
-    plugin->StartFocusListener();
-
+  plugin->CheckForInactivity();
+  plugin->StartFocusListener();
+  plugin->MonitorAllInputDevices();
 
   // Пример: метод-хендлер, обрабатывающий вызовы из Dart
   channel->SetMethodCallHandler(
@@ -175,8 +170,6 @@ void WindowFocusPlugin::RegisterWithRegistrar(
       plugin_pointer->HandleMethodCall(call, std::move(result));
     }
   );
-
-  // Если нужно, можно запустить поток: plugin->CheckForInactivity(); и т.д.
 
   // Регистрируем плагин в системе Flutter
   registrar->AddPlugin(std::move(plugin));
@@ -204,11 +197,17 @@ std::string GetFocusedWindowTitle() {
 }
 
 WindowFocusPlugin::WindowFocusPlugin() {
- instance_ = this;
+  instance_ = this;
 
   // Инициализируем момент времени (для отслеживания активности)
   lastActivityTime = std::chrono::steady_clock::now();
-  }
+  
+  // Initialize controller states
+  ZeroMemory(lastControllerStates_, sizeof(lastControllerStates_));
+  
+  // Initialize last mouse position
+  GetCursorPos(&lastMousePosition_);
+}
 
 WindowFocusPlugin::~WindowFocusPlugin() {
   instance_ = nullptr;
@@ -219,7 +218,6 @@ void WindowFocusPlugin::HandleMethodCall(
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
 
   const auto& method_name = method_call.method_name();
-
 
   if (method_name == "setDebugMode") {
       // Извлекаем аргументы
@@ -237,7 +235,24 @@ void WindowFocusPlugin::HandleMethodCall(
       }
       result->Error("Invalid argument", "Expected a bool for 'debug'.");
       return;
-    }
+  }
+
+  // New: Enable/disable controller monitoring
+  if (method_name == "setControllerMonitoring") {
+      if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
+        auto it = args->find(flutter::EncodableValue("enabled"));
+        if (it != args->end()) {
+          if (std::holds_alternative<bool>(it->second)) {
+            monitorControllers_ = std::get<bool>(it->second);
+            std::cout << "[WindowFocus] Controller monitoring set to " << (monitorControllers_ ? "true" : "false") << std::endl;
+            result->Success();
+            return;
+          }
+        }
+      }
+      result->Error("Invalid argument", "Expected a bool for 'enabled'.");
+      return;
+  }
 
   // Пример: установить таймаут
   if (method_name == "setInactivityTimeOut") {
@@ -301,6 +316,7 @@ std::string GetProcessName(DWORD processID) {
 
     return ConvertWStringToUTF8(processName);
 }
+
 std::string GetFocusedWindowAppName() {
     HWND hwnd = GetForegroundWindow();
     if (hwnd == NULL) {
@@ -313,14 +329,97 @@ std::string GetFocusedWindowAppName() {
     return GetProcessName(processID);
 }
 
+// NEW: Check for XInput controller/gamepad input
+bool WindowFocusPlugin::CheckControllerInput() {
+    if (!monitorControllers_) {
+        return false;
+    }
+
+    bool inputDetected = false;
+
+    for (DWORD i = 0; i < XUSER_MAX_COUNT; i++) {
+        XINPUT_STATE state;
+        ZeroMemory(&state, sizeof(XINPUT_STATE));
+
+        // Get the state of the controller
+        DWORD result = XInputGetState(i, &state);
+
+        if (result == ERROR_SUCCESS) {
+            // Controller is connected
+            // Compare with last known state
+            if (state.dwPacketNumber != lastControllerStates_[i].dwPacketNumber) {
+                // State has changed - input detected
+                if (enableDebug_) {
+                    std::cout << "[WindowFocus] Controller " << i << " input detected" << std::endl;
+                }
+                inputDetected = true;
+                lastControllerStates_[i] = state;
+            }
+        }
+    }
+
+    return inputDetected;
+}
+
+// NEW: Check for raw input devices (additional input devices beyond standard mouse/keyboard)
+bool WindowFocusPlugin::CheckRawInput() {
+    // Check if mouse has moved (alternative to mouse hook)
+    POINT currentMousePos;
+    if (GetCursorPos(&currentMousePos)) {
+        if (currentMousePos.x != lastMousePosition_.x || currentMousePos.y != lastMousePosition_.y) {
+            lastMousePosition_ = currentMousePos;
+            if (enableDebug_) {
+                std::cout << "[WindowFocus] Mouse movement detected via cursor position" << std::endl;
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// NEW: Monitor all input devices in a separate thread
+void WindowFocusPlugin::MonitorAllInputDevices() {
+    std::thread([this]() {
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            bool inputDetected = false;
+
+            // Check controllers
+            if (CheckControllerInput()) {
+                inputDetected = true;
+            }
+
+            // Check raw input (mouse movement via cursor position)
+            if (CheckRawInput()) {
+                inputDetected = true;
+            }
+
+            // If any input was detected, update activity time
+            if (inputDetected) {
+                UpdateLastActivityTime();
+                
+                // If user was inactive, mark them as active
+                if (!userIsActive_) {
+                    userIsActive_ = true;
+                    if (channel) {
+                        channel->InvokeMethod(
+                            "onUserActive",
+                            std::make_unique<flutter::EncodableValue>("User is active"));
+                    }
+                }
+            }
+        }
+    }).detach();
+}
+
 void WindowFocusPlugin::CheckForInactivity() {
   std::thread([this]() {
    while (true) {
      std::this_thread::sleep_for(std::chrono::seconds(1));
      auto now = std::chrono::steady_clock::now();
      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastActivityTime).count();
-
-
 
      if (duration > inactivityThreshold_ && userIsActive_) {
        userIsActive_ = false;
@@ -335,10 +434,10 @@ void WindowFocusPlugin::CheckForInactivity() {
    }
   }).detach();
 }
+
 void WindowFocusPlugin::StartFocusListener(){
     std::thread([this]() {
         HWND last_focused = nullptr;
-//        std::string last_title = nullptr;
         while (true) {
             HWND current_focused = GetForegroundWindow();
             if (current_focused != last_focused) {
@@ -351,11 +450,9 @@ void WindowFocusPlugin::StartFocusListener(){
 
                 if (instance_ && instance_->enableDebug_) {
                  std::cout << "Current window title: " << window_title << std::endl;
-                                std::cout << "Current window name: " << windowTitle << std::endl;
-                                std::cout << "Current window appName: " << appName << std::endl;
-                         }
-
-
+                 std::cout << "Current window name: " << windowTitle << std::endl;
+                 std::cout << "Current window appName: " << appName << std::endl;
+                }
 
                 std::string utf8_output = ConvertWindows1251ToUTF8(window_title);
                 std::string utf8_windowTitle = ConvertWindows1251ToUTF8(windowTitle);
@@ -365,13 +462,6 @@ void WindowFocusPlugin::StartFocusListener(){
                 data[flutter::EncodableValue("appName")] = flutter::EncodableValue(appName);
                 data[flutter::EncodableValue("windowTitle")] = flutter::EncodableValue(utf8_windowTitle);
                 channel->InvokeMethod("onFocusChange", std::make_unique<flutter::EncodableValue>(data));
-
-/*                registrar_->GetTaskRunner()->PostTask([this]() {
-                    channel->InvokeMethod("onFocusChange",
-                        std::make_unique<flutter::EncodableValue>(data));
-                  });*/
-
-
             }
             Sleep(100);
         }
@@ -418,9 +508,6 @@ std::optional<std::vector<uint8_t>> WindowFocusPlugin::TakeScreenshot(bool activ
     SelectObject(hdcMemDC, hbmScreen);
 
     if (activeWindowOnly) {
-        // Для активного окна используем BitBlt с координатами окна, так как PrintWindow может не работать для некоторых приложений (например, Chrome с аппаратным ускорением)
-        // Но BitBlt тоже может вернуть черный экран для некоторых приложений (Chrome, Discord и т.д.)
-        // Самый надежный способ - BitBlt с hdcScreen, но только нужной области
         BitBlt(hdcMemDC, 0, 0, width, height, hdcScreen, rc.left, rc.top, SRCCOPY);
     } else {
         BitBlt(hdcMemDC, 0, 0, width, height, hdcScreen, rc.left, rc.top, SRCCOPY);
