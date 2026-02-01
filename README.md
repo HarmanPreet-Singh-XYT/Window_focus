@@ -37,6 +37,11 @@ You need to add the following code to the Info.plist file for MacOS:
 <key>NSApplicationSupportsSecureRestorableState</key>
 <true/>
 ```
+You need to add the following for usb device detection like controller and other HID to macos/Runner/Release.entitlements and macos/Runner/DebugProfile.entitlements
+```xml
+<key>com.apple.security.device.usb</key>
+<true/>
+```
 
 ### Setup for screen recording (screenshots)
 To use the screenshot functionality on macOS 10.15+, you must request screen recording permission. You can check the permission status using `checkScreenRecordingPermission()` and request it using `requestScreenRecordingPermission()`.
