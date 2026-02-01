@@ -292,7 +292,7 @@ public class IdleTracker: NSObject {
     private var userIsActive: Bool = true
 
     // New monitoring flags
-    private var monitorControllers: Bool = true
+    private var monitorControllers: Bool = true  // Controllers are detected via HID system
     private var monitorAudio: Bool = true
     private var monitorHIDDevices: Bool = true
     private var audioThreshold: Float = 0.001
@@ -305,10 +305,6 @@ public class IdleTracker: NSObject {
     private var hidManager: IOHIDManager?
     private var hidDevices: [IOHIDDevice] = []
     private var lastHIDStates: [IOHIDDevice: Data] = [:]
-
-    // Controller tracking (using IOKit for game controllers)
-    private var controllerDevices: [IOHIDDevice] = []
-    private var lastControllerStates: [IOHIDDevice: Data] = [:]
 
     // Audio monitoring
     private var audioEngine: AVAudioEngine?
@@ -461,7 +457,7 @@ public class IdleTracker: NSObject {
         
         // Register input value callback
         IOHIDDeviceRegisterInputValueCallback(device, { context, result, sender, value in
-            guard let context = context else { return }
+            guard let context = context, let sender = sender else { return }
             let tracker = Unmanaged<IdleTracker>.fromOpaque(context).takeUnretainedValue()
             tracker.handleHIDInput(from: sender)
         }, UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()))
@@ -484,8 +480,10 @@ public class IdleTracker: NSObject {
         }
     }
 
-    private func handleHIDInput(from device: IOHIDDevice) {
+    private func handleHIDInput(from devicePointer: UnsafeMutableRawPointer) {
         if !monitorHIDDevices { return }
+        
+        let device = Unmanaged<IOHIDDevice>.fromOpaque(devicePointer).takeUnretainedValue()
         
         if debugMode {
             print("[WindowFocus] HID input detected")
