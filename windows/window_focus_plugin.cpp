@@ -27,6 +27,9 @@
 #include <sstream>
 #include <vector>
 #include <gdiplus.h>
+#include <setupapi.h>
+#include <hidclass.h>
+#include <functiondiscoverykeys_devpkey.h>
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "XInput.lib")
@@ -44,10 +47,8 @@ LRESULT CALLBACK WindowFocusPlugin::KeyboardProc(int nCode, WPARAM wParam, LPARA
     if (instance_->enableDebug_) {
       std::cout << "[WindowFocus] keyboard hook detected action" << std::endl;
     }
-    // Обращаемся к нестатическим полям через instance_
     instance_->UpdateLastActivityTime();
 
-    // Если пользователь числился неактивным, "пробуждаем" его
     if (!instance_->userIsActive_) {
       instance_->userIsActive_ = true;
       if (instance_->channel) {
@@ -82,7 +83,6 @@ void WindowFocusPlugin::SetHooks() {
   if (instance_ && instance_->enableDebug_) {
     std::cout << "[WindowFocus] SetHooks: start\n";
   }
-  // Пример: глобальные LL-хуки
   HINSTANCE hInstance = GetModuleHandle(nullptr);
 
   keyboardHook_ = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, hInstance, 0);
@@ -145,25 +145,19 @@ std::string ConvertWStringToUTF8(const std::wstring& wstr) {
 void WindowFocusPlugin::RegisterWithRegistrar(
     flutter::PluginRegistrarWindows* registrar) {
 
-  // Создаём канал
   auto channel = std::make_shared<flutter::MethodChannel<flutter::EncodableValue>>(
       registrar->messenger(),
       "expert.kotelnikoff/window_focus",
       &flutter::StandardMethodCodec::GetInstance());
 
-  // Создаём сам плагин
   auto plugin = std::make_unique<WindowFocusPlugin>();
-  // Запоминаем канал в объекте
   plugin->channel = channel;
 
-  // Если нужно: устанавливаем хуки
   plugin->SetHooks();
-
   plugin->CheckForInactivity();
   plugin->StartFocusListener();
   plugin->MonitorAllInputDevices();
 
-  // Пример: метод-хендлер, обрабатывающий вызовы из Dart
   channel->SetMethodCallHandler(
     [plugin_pointer = plugin.get()](const auto& call,
                                     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
@@ -171,7 +165,6 @@ void WindowFocusPlugin::RegisterWithRegistrar(
     }
   );
 
-  // Регистрируем плагин в системе Flutter
   registrar->AddPlugin(std::move(plugin));
 }
 
@@ -199,7 +192,6 @@ std::string GetFocusedWindowTitle() {
 WindowFocusPlugin::WindowFocusPlugin() {
   instance_ = this;
 
-  // Инициализируем момент времени (для отслеживания активности)
   lastActivityTime = std::chrono::steady_clock::now();
   
   // Initialize controller states
@@ -210,6 +202,7 @@ WindowFocusPlugin::WindowFocusPlugin() {
 }
 
 WindowFocusPlugin::~WindowFocusPlugin() {
+  CloseHIDDevices();
   instance_ = nullptr;
 }
 
@@ -220,7 +213,6 @@ void WindowFocusPlugin::HandleMethodCall(
   const auto& method_name = method_call.method_name();
 
   if (method_name == "setDebugMode") {
-      // Извлекаем аргументы
       if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
         auto it = args->find(flutter::EncodableValue("debug"));
         if (it != args->end()) {
@@ -237,7 +229,6 @@ void WindowFocusPlugin::HandleMethodCall(
       return;
   }
 
-  // New: Enable/disable controller monitoring
   if (method_name == "setControllerMonitoring") {
       if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
         auto it = args->find(flutter::EncodableValue("enabled"));
@@ -254,7 +245,65 @@ void WindowFocusPlugin::HandleMethodCall(
       return;
   }
 
-  // Пример: установить таймаут
+  // NEW: Set audio monitoring
+  if (method_name == "setAudioMonitoring") {
+      if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
+        auto it = args->find(flutter::EncodableValue("enabled"));
+        if (it != args->end()) {
+          if (std::holds_alternative<bool>(it->second)) {
+            monitorAudio_ = std::get<bool>(it->second);
+            std::cout << "[WindowFocus] Audio monitoring set to " << (monitorAudio_ ? "true" : "false") << std::endl;
+            result->Success();
+            return;
+          }
+        }
+      }
+      result->Error("Invalid argument", "Expected a bool for 'enabled'.");
+      return;
+  }
+
+  // NEW: Set audio threshold
+  if (method_name == "setAudioThreshold") {
+      if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
+        auto it = args->find(flutter::EncodableValue("threshold"));
+        if (it != args->end()) {
+          if (std::holds_alternative<double>(it->second)) {
+            audioThreshold_ = static_cast<float>(std::get<double>(it->second));
+            std::cout << "[WindowFocus] Audio threshold set to " << audioThreshold_ << std::endl;
+            result->Success();
+            return;
+          }
+        }
+      }
+      result->Error("Invalid argument", "Expected a double for 'threshold'.");
+      return;
+  }
+
+  // NEW: Set HID device monitoring
+  if (method_name == "setHIDMonitoring") {
+      if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
+        auto it = args->find(flutter::EncodableValue("enabled"));
+        if (it != args->end()) {
+          if (std::holds_alternative<bool>(it->second)) {
+            bool newValue = std::get<bool>(it->second);
+            if (newValue && !monitorHIDDevices_) {
+              // Re-initialize HID devices if enabling
+              InitializeHIDDevices();
+            } else if (!newValue && monitorHIDDevices_) {
+              // Close HID devices if disabling
+              CloseHIDDevices();
+            }
+            monitorHIDDevices_ = newValue;
+            std::cout << "[WindowFocus] HID device monitoring set to " << (monitorHIDDevices_ ? "true" : "false") << std::endl;
+            result->Success();
+            return;
+          }
+        }
+      }
+      result->Error("Invalid argument", "Expected a bool for 'enabled'.");
+      return;
+  }
+
   if (method_name == "setInactivityTimeOut") {
     if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
       auto it = args->find(flutter::EncodableValue("inactivityTimeOut"));
@@ -329,7 +378,6 @@ std::string GetFocusedWindowAppName() {
     return GetProcessName(processID);
 }
 
-// NEW: Check for XInput controller/gamepad input
 bool WindowFocusPlugin::CheckControllerInput() {
     if (!monitorControllers_) {
         return false;
@@ -341,14 +389,10 @@ bool WindowFocusPlugin::CheckControllerInput() {
         XINPUT_STATE state;
         ZeroMemory(&state, sizeof(XINPUT_STATE));
 
-        // Get the state of the controller
         DWORD result = XInputGetState(i, &state);
 
         if (result == ERROR_SUCCESS) {
-            // Controller is connected
-            // Compare with last known state
             if (state.dwPacketNumber != lastControllerStates_[i].dwPacketNumber) {
-                // State has changed - input detected
                 if (enableDebug_) {
                     std::cout << "[WindowFocus] Controller " << i << " input detected" << std::endl;
                 }
@@ -361,9 +405,7 @@ bool WindowFocusPlugin::CheckControllerInput() {
     return inputDetected;
 }
 
-// NEW: Check for raw input devices (additional input devices beyond standard mouse/keyboard)
 bool WindowFocusPlugin::CheckRawInput() {
-    // Check if mouse has moved (alternative to mouse hook)
     POINT currentMousePos;
     if (GetCursorPos(&currentMousePos)) {
         if (currentMousePos.x != lastMousePosition_.x || currentMousePos.y != lastMousePosition_.y) {
@@ -378,21 +420,303 @@ bool WindowFocusPlugin::CheckRawInput() {
     return false;
 }
 
-// NEW: Monitor all input devices in a separate thread
+// NEW: Check system audio playback
+bool WindowFocusPlugin::CheckSystemAudio() {
+    if (!monitorAudio_) {
+        return false;
+    }
+
+    static bool comInitialized = false;
+    if (!comInitialized) {
+        CoInitialize(nullptr);
+        comInitialized = true;
+    }
+    
+    IMMDeviceEnumerator* deviceEnumerator = nullptr;
+    IMMDevice* defaultDevice = nullptr;
+    IAudioMeterInformation* meterInfo = nullptr;
+    float peakValue = 0.0f;
+    bool audioDetected = false;
+
+    HRESULT hr = CoCreateInstance(
+        __uuidof(MMDeviceEnumerator),
+        nullptr,
+        CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator),
+        (void**)&deviceEnumerator
+    );
+
+    if (SUCCEEDED(hr)) {
+        hr = deviceEnumerator->GetDefaultAudioEndpoint(
+            eRender, eConsole, &defaultDevice
+        );
+    }
+
+    if (SUCCEEDED(hr)) {
+        hr = defaultDevice->Activate(
+            __uuidof(IAudioMeterInformation),
+            CLSCTX_ALL,
+            nullptr,
+            (void**)&meterInfo
+        );
+    }
+
+    if (SUCCEEDED(hr)) {
+        hr = meterInfo->GetPeakValue(&peakValue);
+        
+        if (SUCCEEDED(hr) && peakValue > audioThreshold_) {
+            audioDetected = true;
+            if (enableDebug_) {
+                std::cout << "[WindowFocus] Audio detected, peak: " << peakValue << std::endl;
+            }
+        }
+    }
+
+    // Cleanup
+    if (meterInfo) meterInfo->Release();
+    if (defaultDevice) defaultDevice->Release();
+    if (deviceEnumerator) deviceEnumerator->Release();
+    
+    return audioDetected;
+}
+
+// NEW: Initialize HID devices
+void WindowFocusPlugin::InitializeHIDDevices() {
+    // Close any existing devices first
+    CloseHIDDevices();
+    
+    GUID hidGuid;
+    HidD_GetHidGuid(&hidGuid);
+    
+    HDEVINFO deviceInfoSet = SetupDiGetClassDevs(
+        &hidGuid,
+        nullptr,
+        nullptr,
+        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE
+    );
+    
+    if (deviceInfoSet == INVALID_HANDLE_VALUE) {
+        if (enableDebug_) {
+            std::cerr << "[WindowFocus] Failed to get HID device info set" << std::endl;
+        }
+        return;
+    }
+    
+    SP_DEVICE_INTERFACE_DATA deviceInterfaceData;
+    deviceInterfaceData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+    
+    DWORD memberIndex = 0;
+    while (SetupDiEnumDeviceInterfaces(
+        deviceInfoSet,
+        nullptr,
+        &hidGuid,
+        memberIndex++,
+        &deviceInterfaceData
+    )) {
+        DWORD requiredSize = 0;
+        SetupDiGetDeviceInterfaceDetail(
+            deviceInfoSet,
+            &deviceInterfaceData,
+            nullptr,
+            0,
+            &requiredSize,
+            nullptr
+        );
+        
+        PSP_DEVICE_INTERFACE_DETAIL_DATA detailData = 
+            (PSP_DEVICE_INTERFACE_DETAIL_DATA)malloc(requiredSize);
+        if (!detailData) continue;
+        
+        detailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
+        
+        if (SetupDiGetDeviceInterfaceDetail(
+            deviceInfoSet,
+            &deviceInterfaceData,
+            detailData,
+            requiredSize,
+            nullptr,
+            nullptr
+        )) {
+            HANDLE deviceHandle = CreateFile(
+                detailData->DevicePath,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED, // Use overlapped I/O for non-blocking
+                nullptr
+            );
+            
+            if (deviceHandle != INVALID_HANDLE_VALUE) {
+                HIDD_ATTRIBUTES attributes;
+                attributes.Size = sizeof(HIDD_ATTRIBUTES);
+                
+                if (HidD_GetAttributes(deviceHandle, &attributes)) {
+                    // Detect ALL HID input devices except audio/microphone devices
+                    
+                    PHIDP_PREPARSED_DATA preparsedData;
+                    if (HidD_GetPreparsedData(deviceHandle, &preparsedData)) {
+                        HIDP_CAPS caps;
+                        if (HidP_GetCaps(preparsedData, &caps) == HIDP_STATUS_SUCCESS) {
+                            // EXCLUDE audio devices (microphones, headsets, etc.)
+                            // Usage Page 0x0C = Consumer Devices (often includes audio controls)
+                            // Usage Page 0x0B = Telephony Devices (microphones, headsets)
+                            // We want to exclude these to avoid detecting microphone input
+                            
+                            bool isAudioDevice = (caps.UsagePage == 0x0B || caps.UsagePage == 0x0C);
+                            
+                            // INCLUDE all other HID devices with input capabilities
+                            // This includes:
+                            // - Game controllers (0x01/0x04, 0x01/0x05, 0x01/0x08)
+                            // - Keyboards (0x01/0x06) - though already covered by keyboard hook
+                            // - Mouse (0x01/0x02) - though already covered by mouse hook
+                            // - Drawing tablets (0x0D)
+                            // - Generic input devices
+                            // - Custom HID devices
+                            
+                            if (!isAudioDevice && caps.InputReportByteLength > 0) {
+                                hidDeviceHandles_.push_back(deviceHandle);
+                                lastHIDStates_.push_back(std::vector<BYTE>(caps.InputReportByteLength, 0));
+                                
+                                if (enableDebug_) {
+                                    std::cout << "[WindowFocus] HID device added: VID=" 
+                                              << std::hex << attributes.VendorID 
+                                              << " PID=" << attributes.ProductID 
+                                              << std::dec 
+                                              << " UsagePage=0x" << std::hex << caps.UsagePage
+                                              << " Usage=0x" << caps.Usage << std::dec << std::endl;
+                                }
+                            } else {
+                                if (enableDebug_ && isAudioDevice) {
+                                    std::cout << "[WindowFocus] Skipping audio device: VID=" 
+                                              << std::hex << attributes.VendorID 
+                                              << " PID=" << attributes.ProductID 
+                                              << " UsagePage=0x" << caps.UsagePage << std::dec << std::endl;
+                                }
+                                CloseHandle(deviceHandle);
+                            }
+                        } else {
+                            CloseHandle(deviceHandle);
+                        }
+                        HidD_FreePreparsedData(preparsedData);
+                    } else {
+                        CloseHandle(deviceHandle);
+                    }
+                } else {
+                    CloseHandle(deviceHandle);
+                }
+            }
+        }
+        
+        free(detailData);
+    }
+    
+    SetupDiDestroyDeviceInfoList(deviceInfoSet);
+    
+    if (enableDebug_) {
+        std::cout << "[WindowFocus] Initialized " << hidDeviceHandles_.size() << " HID devices" << std::endl;
+    }
+}
+
+// NEW: Check HID devices for input
+bool WindowFocusPlugin::CheckHIDDevices() {
+    if (!monitorHIDDevices_ || hidDeviceHandles_.empty()) {
+        return false;
+    }
+
+    bool inputDetected = false;
+    
+    for (size_t i = 0; i < hidDeviceHandles_.size(); i++) {
+        HANDLE deviceHandle = hidDeviceHandles_[i];
+        std::vector<BYTE>& lastState = lastHIDStates_[i];
+        std::vector<BYTE> buffer(lastState.size());
+        
+        OVERLAPPED overlapped = {0};
+        overlapped.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        
+        DWORD bytesRead = 0;
+        if (ReadFile(deviceHandle, buffer.data(), buffer.size(), &bytesRead, &overlapped)) {
+            // Read completed immediately
+            if (bytesRead > 0 && buffer != lastState) {
+                inputDetected = true;
+                lastState = buffer;
+                
+                if (enableDebug_) {
+                    std::cout << "[WindowFocus] HID device " << i << " input detected" << std::endl;
+                }
+            }
+        } else {
+            DWORD error = GetLastError();
+            if (error == ERROR_IO_PENDING) {
+                // Wait for a short time (non-blocking check)
+                DWORD waitResult = WaitForSingleObject(overlapped.hEvent, 0);
+                if (waitResult == WAIT_OBJECT_0) {
+                    if (GetOverlappedResult(deviceHandle, &overlapped, &bytesRead, FALSE)) {
+                        if (bytesRead > 0 && buffer != lastState) {
+                            inputDetected = true;
+                            lastState = buffer;
+                            
+                            if (enableDebug_) {
+                                std::cout << "[WindowFocus] HID device " << i << " input detected (overlapped)" << std::endl;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        CloseHandle(overlapped.hEvent);
+        
+        if (inputDetected) {
+            break; // Exit early if we detected input
+        }
+    }
+    
+    return inputDetected;
+}
+
+// NEW: Close all HID devices
+void WindowFocusPlugin::CloseHIDDevices() {
+    for (HANDLE handle : hidDeviceHandles_) {
+        CloseHandle(handle);
+    }
+    hidDeviceHandles_.clear();
+    lastHIDStates_.clear();
+    
+    if (enableDebug_) {
+        std::cout << "[WindowFocus] Closed all HID devices" << std::endl;
+    }
+}
+
 void WindowFocusPlugin::MonitorAllInputDevices() {
+    // Initialize HID devices
+    if (monitorHIDDevices_) {
+        InitializeHIDDevices();
+    }
+    
     std::thread([this]() {
         while (true) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
             bool inputDetected = false;
 
-            // Check controllers
+            // Check controllers (XInput)
             if (CheckControllerInput()) {
                 inputDetected = true;
             }
 
             // Check raw input (mouse movement via cursor position)
             if (CheckRawInput()) {
+                inputDetected = true;
+            }
+
+            // NEW: Check system audio
+            if (CheckSystemAudio()) {
+                inputDetected = true;
+            }
+
+            // NEW: Check HID devices (Logitech G29, flight sticks, etc.)
+            if (CheckHIDDevices()) {
                 inputDetected = true;
             }
 

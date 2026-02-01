@@ -46,7 +46,17 @@ target_compile_definitions(${PLUGIN_NAME} PRIVATE FLUTTER_PLUGIN_IMPL)
 # dependencies here.
 target_include_directories(${PLUGIN_NAME} INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(${PLUGIN_NAME} PRIVATE flutter flutter_wrapper_plugin xinput gdiplus)
+
+# Link all required libraries
+target_link_libraries(${PLUGIN_NAME} PRIVATE 
+  flutter 
+  flutter_wrapper_plugin 
+  xinput      # XInput controller support
+  gdiplus     # Screenshot functionality
+  ole32       # COM/Audio detection
+  hid         # HID device support
+  setupapi    # HID device enumeration
+)
 
 # List of absolute paths to libraries that should be bundled with the plugin.
 # This list could contain prebuilt libraries, or libraries created by an
@@ -76,6 +86,7 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 # Disable install commands for gtest so it doesn't end up in the bundle.
 set(INSTALL_GTEST OFF CACHE BOOL "Disable installation of googletest" FORCE)
+
 FetchContent_MakeAvailable(googletest)
 
 # The plugin's C API is not very useful for unit testing, so build the sources
@@ -86,8 +97,16 @@ add_executable(${TEST_RUNNER}
 )
 apply_standard_settings(${TEST_RUNNER})
 target_include_directories(${TEST_RUNNER} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(${TEST_RUNNER} PRIVATE flutter_wrapper_plugin xinput gdiplus)
+target_link_libraries(${TEST_RUNNER} PRIVATE 
+  flutter_wrapper_plugin 
+  xinput 
+  gdiplus
+  ole32
+  hid
+  setupapi
+)
 target_link_libraries(${TEST_RUNNER} PRIVATE gtest_main gmock)
+
 # flutter_wrapper_plugin has link dependencies on the Flutter DLL.
 add_custom_command(TARGET ${TEST_RUNNER} POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different

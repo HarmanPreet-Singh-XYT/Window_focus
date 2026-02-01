@@ -5,19 +5,27 @@
 #include <flutter/plugin_registrar_windows.h>
 #include <chrono>
 #include <memory>
+#include <vector>
 #include <windows.h>
 #include <xinput.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <endpointvolume.h>
+#include <hidsdi.h>
 
 #pragma comment(lib, "XInput.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "hid.lib")
+#pragma comment(lib, "setupapi.lib")
 
 namespace window_focus {
 
 class WindowFocusPlugin : public flutter::Plugin {
  public:
-  // Метод для регистрации плагина
+  // Method for registering the plugin
   static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar);
 
-  // Конструктор / деструктор
+  // Constructor / Destructor
   WindowFocusPlugin();
   virtual ~WindowFocusPlugin();
 
@@ -26,18 +34,17 @@ class WindowFocusPlugin : public flutter::Plugin {
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 
  private:
-  // == 1) Указатель на «единственный» экземпляр (singleton-like).
-  // Статические хуки будут обращаться к instance_->...
+  // == 1) Singleton-like instance pointer
   static WindowFocusPlugin* instance_;
 
-  // == 2) Статические хуки и статические переменные-хуки.
+  // == 2) Static hooks and hook variables
   static HHOOK keyboardHook_;
   static HHOOK mouseHook_;
   
   static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
   static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam);
 
-  // == 3) Ваши обычные (нестатические) поля
+  // == 3) Regular (non-static) fields
   std::shared_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel;
   
   bool userIsActive_ = true;
@@ -46,28 +53,40 @@ class WindowFocusPlugin : public flutter::Plugin {
   
   std::chrono::steady_clock::time_point lastActivityTime;
   
-  // New: For controller/gamepad detection
+  // Controller/gamepad detection
   bool monitorControllers_ = true;
   XINPUT_STATE lastControllerStates_[XUSER_MAX_COUNT];
   POINT lastMousePosition_;
+  
+  // Audio detection
+  bool monitorAudio_ = true;
+  float audioThreshold_ = 0.001f; // Minimum audio level to consider as activity
+  
+  // HID device detection
+  bool monitorHIDDevices_ = true;
+  std::vector<HANDLE> hidDeviceHandles_;
+  std::vector<std::vector<BYTE>> lastHIDStates_; // Store last state for each device
 
-  // == 4) Внутренние методы
+  // == 4) Internal methods
   void SetHooks();
   void RemoveHooks();
-
-  // При вводе с клавиатуры/мыши обновляем время
   void UpdateLastActivityTime();
-
-  // Пример: метод обработки вызовов из Dart
-
-  // Доп. методы: CheckForInactivity(), StartFocusListener() и т.д. по желанию
+  
   void CheckForInactivity();
   void StartFocusListener();
   
-  // New: Controller and input monitoring
+  // Input monitoring
   void MonitorAllInputDevices();
   bool CheckControllerInput();
   bool CheckRawInput();
+  
+  // NEW: Audio detection
+  bool CheckSystemAudio();
+  
+  // NEW: HID device detection
+  void InitializeHIDDevices();
+  bool CheckHIDDevices();
+  void CloseHIDDevices();
   
   std::optional<std::vector<uint8_t>> TakeScreenshot(bool activeWindowOnly);
 };

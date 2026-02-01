@@ -3,12 +3,10 @@ import 'dart:async';
 import 'package:flutter/services.dart';
 import 'domain/domain.dart';
 
-
-
 /// The WindowFocus plugin provides functionality for tracking user activity
 /// and the currently active window on the Windows and macOS platforms. It is useful for applications
 /// that need to monitor user interaction with the system.
-class WindowFocus{
+class WindowFocus {
   /// Creates an instance of `WindowFocus` for tracking user activity and window focus.
   ///
   /// The constructor allows enabling debug mode and setting the user inactivity timeout
@@ -18,6 +16,15 @@ class WindowFocus{
   ///   Useful for diagnosing plugin behavior during development.
   /// - [duration]: The user inactivity timeout after which the plugin sends an event
   ///   indicating that the user is inactive. Default is 1 second.
+  /// - [monitorAudio]: If `true`, system audio playback will be monitored to prevent
+  ///   idle state when watching videos or listening to music. Default is `true`.
+  /// - [monitorControllers]: If `true`, XInput controllers (Xbox controllers) will be
+  ///   monitored for input. Default is `true`.
+  /// - [monitorHIDDevices]: If `true`, ALL HID input devices (except microphones) will be
+  ///   monitored. This includes racing wheels, drawing tablets, custom USB devices, etc.
+  ///   Default is `true`.
+  /// - [audioThreshold]: The minimum audio level (0.0 to 1.0) to consider as activity.
+  ///   Default is 0.001. Lower values are more sensitive.
   ///
   /// Example usage:
   ///
@@ -31,34 +38,51 @@ class WindowFocus{
   /// final windowFocus = WindowFocus(duration: Duration(seconds: 30));
   /// ```
   ///
-  /// Enable debug mode and set a custom timeout:
+  /// Enable all monitoring with custom settings:
   /// ```dart
   /// final windowFocus = WindowFocus(
   ///   debug: true,
   ///   duration: Duration(seconds: 10),
+  ///   monitorAudio: true,
+  ///   monitorControllers: true,
+  ///   monitorHIDDevices: true,
+  ///   audioThreshold: 0.002,
   /// );
   /// ```
-  WindowFocus({bool debug = false,Duration duration=const Duration(seconds: 1)}) {
+  ///
+  /// Disable audio monitoring (e.g., for gaming-only apps):
+  /// ```dart
+  /// final windowFocus = WindowFocus(
+  ///   monitorAudio: false,
+  /// );
+  /// ```
+  WindowFocus({
+    bool debug = false,
+    Duration duration = const Duration(seconds: 1),
+    bool monitorAudio = true,
+    bool monitorControllers = true,
+    bool monitorHIDDevices = true,
+    double audioThreshold = 0.001,
+  }) {
     _debug = debug;
     _channel.setMethodCallHandler(_handleMethodCall);
     if (_debug) {
       setDebug(_debug);
     }
     setIdleThreshold(duration: duration);
+    setAudioMonitoring(monitorAudio);
+    setControllerMonitoring(monitorControllers);
+    setHIDMonitoring(monitorHIDDevices);
+    setAudioThreshold(audioThreshold);
   }
 
-
-
-
-
-  static const MethodChannel _channel = MethodChannel('expert.kotelnikoff/window_focus');
+  static const MethodChannel _channel =
+      MethodChannel('expert.kotelnikoff/window_focus');
   bool _debug = false;
   bool _userActive = true;
 
   final _focusChangeController = StreamController<AppWindowDto>.broadcast();
   final _userActiveController = StreamController<bool>.broadcast();
-
-
 
   Future<dynamic> _handleMethodCall(MethodCall call) async {
     switch (call.method) {
@@ -108,7 +132,9 @@ class WindowFocus{
   /// On macOS 10.15+, this requires user authorization in
   /// System Preferences > Security & Privacy > Privacy > Screen Recording.
   Future<bool> checkScreenRecordingPermission() async {
-    return await _channel.invokeMethod<bool>('checkScreenRecordingPermission') ?? false;
+    return await _channel
+            .invokeMethod<bool>('checkScreenRecordingPermission') ??
+        false;
   }
 
   /// Requests permission to record the screen.
@@ -129,10 +155,11 @@ class WindowFocus{
   /// await _windowFocus.setIdleThreshold(Duration(seconds: 10));
   /// ```
   Future<void> setIdleThreshold({required Duration duration}) async {
-    await _channel.invokeMethod('setInactivityTimeOut',  {
+    await _channel.invokeMethod('setInactivityTimeOut', {
       'inactivityTimeOut': duration.inMilliseconds,
     });
   }
+
   /// Returns the currently set inactivity timeout.
   ///
   /// Returns: A `Duration` that specifies the time after which the user is considered inactive.
@@ -184,6 +211,84 @@ class WindowFocus{
   /// ```
   Future<void> setControllerMonitoring(bool enabled) async {
     await _channel.invokeMethod('setControllerMonitoring', {
+      'enabled': enabled,
+    });
+  }
+
+  /// Enables or disables system audio monitoring.
+  ///
+  /// When enabled, the plugin will detect system audio playback and treat it as user activity.
+  /// This is useful for preventing idle state when users are watching videos or listening to music.
+  /// This is enabled by default.
+  ///
+  /// - [enabled]: A `bool` that determines whether audio monitoring is enabled (`true`) or disabled (`false`).
+  ///   Default is `true`.
+  ///
+  /// ```dart
+  /// // Enable audio monitoring (default)
+  /// await _windowFocus.setAudioMonitoring(true);
+  ///
+  /// // Disable if you don't want audio to prevent idle state
+  /// await _windowFocus.setAudioMonitoring(false);
+  /// ```
+  Future<void> setAudioMonitoring(bool enabled) async {
+    await _channel.invokeMethod('setAudioMonitoring', {
+      'enabled': enabled,
+    });
+  }
+
+  /// Sets the audio threshold for detecting user activity.
+  ///
+  /// The threshold determines the minimum audio level (0.0 to 1.0) required to
+  /// consider the system as having active audio playback. Lower values are more
+  /// sensitive and will detect quieter sounds.
+  ///
+  /// - [threshold]: A `double` value between 0.0 and 1.0. Default is 0.001.
+  ///   - 0.001 = Very sensitive (detects almost any audio)
+  ///   - 0.01 = Moderately sensitive
+  ///   - 0.1 = Less sensitive (only detects louder audio)
+  ///
+  /// ```dart
+  /// // Very sensitive - detects even quiet background music
+  /// await _windowFocus.setAudioThreshold(0.001);
+  ///
+  /// // Less sensitive - only detects louder audio
+  /// await _windowFocus.setAudioThreshold(0.05);
+  /// ```
+  Future<void> setAudioThreshold(double threshold) async {
+    await _channel.invokeMethod('setAudioThreshold', {
+      'threshold': threshold,
+    });
+  }
+
+  /// Enables or disables HID device monitoring.
+  ///
+  /// When enabled, the plugin will detect input from ALL HID (Human Interface Device) input devices
+  /// except microphones and audio devices. This includes game controllers, drawing tablets, 
+  /// custom USB devices, and more. This is enabled by default.
+  ///
+  /// - [enabled]: A `bool` that determines whether HID device monitoring is enabled (`true`) or disabled (`false`).
+  ///   Default is `true`.
+  ///
+  /// Note: HID device detection covers ALL input devices including:
+  /// - Racing wheels (Logitech G29, G920, Thrustmaster, etc.)
+  /// - Flight sticks and HOTAS controllers
+  /// - Game controllers (non-XInput)
+  /// - Drawing tablets (Wacom, Huion, XP-Pen, etc.)
+  /// - Custom USB input devices
+  /// - Stream decks, foot pedals, button boxes, etc.
+  /// 
+  /// Excluded: Microphones and audio HID devices (to avoid detecting voice as activity)
+  ///
+  /// ```dart
+  /// // Enable HID device monitoring (default)
+  /// await _windowFocus.setHIDMonitoring(true);
+  ///
+  /// // Disable if you only want keyboard/mouse/XInput controller detection
+  /// await _windowFocus.setHIDMonitoring(false);
+  /// ```
+  Future<void> setHIDMonitoring(bool enabled) async {
+    await _channel.invokeMethod('setHIDMonitoring', {
       'enabled': enabled,
     });
   }
