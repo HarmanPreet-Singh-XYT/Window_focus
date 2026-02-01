@@ -635,7 +635,8 @@ bool WindowFocusPlugin::CheckHIDDevices() {
         overlapped.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
         
         DWORD bytesRead = 0;
-        if (ReadFile(deviceHandle, buffer.data(), buffer.size(), &bytesRead, &overlapped)) {
+        DWORD bufferSize = static_cast<DWORD>(buffer.size());
+        if (ReadFile(deviceHandle, buffer.data(), bufferSize, &bytesRead, &overlapped)) {
             // Read completed immediately
             if (bytesRead > 0 && buffer != lastState) {
                 inputDetected = true;
