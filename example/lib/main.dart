@@ -26,11 +26,19 @@ class _MyAppState extends State<MyApp> {
   String activeWindowTitle = 'Unknown';
   String activeAppName = 'Unknown';
   bool isUserActive = true;
-  final _windowFocusPlugin = WindowFocus(debug: true,duration: const Duration(seconds: 10));
+  
+  // Enhanced monitoring settings
+  bool _debugMode = true;
+  bool _monitorAudio = true;
+  bool _monitorControllers = true;
+  bool _monitorHIDDevices = true;
+  double _audioThreshold = 0.001;
+  
+  late WindowFocus _windowFocusPlugin;
   final _messangerKey = GlobalKey<ScaffoldMessengerState>();
   DateTime? lastUpdateTime;
-  final textController=TextEditingController();
-  final idleTimeOutInSeconds=1;
+  final textController = TextEditingController();
+  final idleTimeOutInSeconds = 1;
 
   List<TimeAppDto> items = [];
   Duration allTime = const Duration();
@@ -44,21 +52,53 @@ class _MyAppState extends State<MyApp> {
   Timer? _screenshotTimer;
   String? _lastSavedPath;
   final List<String> _screenshotLogs = [];
+  
+  // Activity detection logs
+  final List<String> _activityLogs = [];
+  int _activityEventCount = 0;
+  DateTime? _lastActivityTime;
 
   @override
   void initState() {
     super.initState();
+    
+    // Initialize with all monitoring features enabled
+    _windowFocusPlugin = WindowFocus(
+      debug: _debugMode,
+      duration: const Duration(seconds: 10),
+      monitorAudio: _monitorAudio,
+      monitorControllers: _monitorControllers,
+      monitorHIDDevices: _monitorHIDDevices,
+      audioThreshold: _audioThreshold,
+    );
 
     _windowFocusPlugin.addFocusChangeListener((p0) {
       _handleFocusChange(p0);
     });
+    
     _windowFocusPlugin.addUserActiveListener((p0) {
       print('User activity changed: isUserActive = $p0');
+      _logActivity(p0 ? 'User became ACTIVE' : 'User became INACTIVE');
       setState(() {
         isUserActive = p0;
+        if (p0) {
+          _lastActivityTime = DateTime.now();
+          _activityEventCount++;
+        }
       });
     });
+    
     _startTimer();
+    _logActivity('Monitoring started with all features enabled');
+  }
+
+  void _logActivity(String message) {
+    final timestamp = DateFormat('HH:mm:ss.SSS').format(DateTime.now());
+    setState(() {
+      _activityLogs.insert(0, '[$timestamp] $message');
+      if (_activityLogs.length > 50) _activityLogs.removeLast();
+    });
+    print('[ActivityLog] $message');
   }
 
   Future<void> _takeScreenshot() async {
@@ -77,7 +117,7 @@ class _MyAppState extends State<MyApp> {
       setState(() {
         _screenshot = screenshot;
         final timestamp = DateFormat('HH:mm:ss').format(DateTime.now());
-        _screenshotLogs.insert(0, '[$timestamp] Screenshot captured');
+        _screenshotLogs.insert(0, '[$timestamp] Screenshot captured (${screenshot.length} bytes)');
         if (_screenshotLogs.length > 20) _screenshotLogs.removeLast();
       });
       await _saveScreenshot(screenshot);
@@ -166,6 +206,7 @@ class _MyAppState extends State<MyApp> {
 
     if (activeWindowTitle != window.windowTitle || activeAppName != window.appName) {
       _updateActiveAppTime(forceUpdate: true);
+      _logActivity('Window changed: ${window.appName} - ${window.windowTitle}');
     }
     activeWindowTitle = window.windowTitle;
     activeAppName = window.appName;
@@ -174,72 +215,212 @@ class _MyAppState extends State<MyApp> {
     setState(() {});
   }
 
+  Future<void> _toggleDebugMode(bool value) async {
+    setState(() {
+      _debugMode = value;
+    });
+    await _windowFocusPlugin.setDebug(value);
+    _logActivity('Debug mode ${value ? 'enabled' : 'disabled'}');
+  }
+
+  Future<void> _toggleAudioMonitoring(bool value) async {
+    setState(() {
+      _monitorAudio = value;
+    });
+    await _windowFocusPlugin.setAudioMonitoring(value);
+    _logActivity('Audio monitoring ${value ? 'enabled' : 'disabled'}');
+  }
+
+  Future<void> _toggleControllerMonitoring(bool value) async {
+    setState(() {
+      _monitorControllers = value;
+    });
+    await _windowFocusPlugin.setControllerMonitoring(value);
+    _logActivity('Controller monitoring ${value ? 'enabled' : 'disabled'}');
+  }
+
+  Future<void> _toggleHIDMonitoring(bool value) async {
+    setState(() {
+      _monitorHIDDevices = value;
+    });
+    await _windowFocusPlugin.setHIDMonitoring(value);
+    _logActivity('HID device monitoring ${value ? 'enabled' : 'disabled'}');
+  }
+
+  Future<void> _updateAudioThreshold(double value) async {
+    setState(() {
+      _audioThreshold = value;
+    });
+    await _windowFocusPlugin.setAudioThreshold(value);
+    _logActivity('Audio threshold set to ${value.toStringAsFixed(4)}');
+  }
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       scaffoldMessengerKey: _messangerKey,
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        useMaterial3: true,
+      ),
       home: Scaffold(
         appBar: AppBar(
-          title: const Text('Window in focus plugin example app'),
+          title: const Text('Window Focus Plugin - Testing Dashboard'),
           actions: [
             IconButton(
               onPressed: _takeScreenshot,
               icon: const Icon(Icons.camera_alt),
-              tooltip: 'Take screenshot of active window',
+              tooltip: 'Take screenshot',
             ),
           ],
         ),
         body: Column(
           children: [
-            if (_screenshot != null)
-              Column(
+            // Status Bar
+            Container(
+              padding: const EdgeInsets.all(16),
+              color: isUserActive ? Colors.green.shade100 : Colors.red.shade100,
+              child: Row(
                 children: [
-                  Container(
-                    height: 200,
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(8.0),
-                    child: Image.memory(_screenshot!, fit: BoxFit.contain),
+                  Icon(
+                    isUserActive ? Icons.check_circle : Icons.pause_circle,
+                    color: isUserActive ? Colors.green : Colors.red,
                   ),
-                  if (_lastSavedPath != null)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 8.0),
-                      child: Text(
-                        'Last saved to: $_lastSavedPath',
-                        style: const TextStyle(fontSize: 10, color: Colors.grey),
-                        overflow: TextOverflow.ellipsis,
-                      ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          isUserActive ? 'USER ACTIVE' : 'USER IDLE',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            color: isUserActive ? Colors.green.shade900 : Colors.red.shade900,
+                          ),
+                        ),
+                        Text(
+                          'Events: $_activityEventCount | Last: ${_lastActivityTime != null ? DateFormat('HH:mm:ss').format(_lastActivityTime!) : 'N/A'}',
+                          style: const TextStyle(fontSize: 11),
+                        ),
+                      ],
                     ),
+                  ),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Text('Active: ${_formatDuration(activeTime)}', style: const TextStyle(fontSize: 12)),
+                      Text('Idle: ${_formatDuration(allTime - activeTime)}', style: const TextStyle(fontSize: 12)),
+                    ],
+                  ),
                 ],
               ),
+            ),
+            
+            if (_screenshot != null)
+              Container(
+                height: 150,
+                width: double.infinity,
+                padding: const EdgeInsets.all(8.0),
+                child: Image.memory(_screenshot!, fit: BoxFit.contain),
+              ),
+            
             Expanded(
               child: Row(
                 children: [
+                  // Left Panel - Settings & Info
                   Expanded(
                     flex: 2,
-                    child: Padding(
+                    child: SingleChildScrollView(
                       padding: const EdgeInsets.all(8.0),
                       child: Column(
-                        mainAxisAlignment: MainAxisAlignment.start,
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: <Widget>[
-                          Text('App Name: $activeAppName'),
-                          Text('Window title in focus: $activeWindowTitle\n'),
-                          Text('User is idle: ${!isUserActive}\n'),
-                          Text('Total Time: ${_formatDuration(allTime)}'),
-                          const SizedBox(height: 10),
-                          Text('Idle Time: ${_formatDuration(allTime - activeTime)}'),
-                          const SizedBox(height: 10),
-                          Text(
-                              'Active Time: ${_formatDuration(activeTime)}'),
-                          const Divider(),
+                          _buildSectionTitle('Current Window'),
+                          _buildInfoCard([
+                            'App: $activeAppName',
+                            'Title: $activeWindowTitle',
+                          ]),
+                          
+                          const SizedBox(height: 16),
+                          _buildSectionTitle('Monitoring Features'),
+                          
                           SwitchListTile(
-                            title: const Text('Auto Screenshot'),
-                            subtitle: Text('Interval: $_screenshotInterval seconds'),
+                            dense: true,
+                            title: const Text('Debug Mode', style: TextStyle(fontSize: 13)),
+                            subtitle: const Text('Enable verbose logging', style: TextStyle(fontSize: 11)),
+                            value: _debugMode,
+                            onChanged: _toggleDebugMode,
+                          ),
+                          
+                          SwitchListTile(
+                            dense: true,
+                            title: const Text('Audio Monitoring', style: TextStyle(fontSize: 13)),
+                            subtitle: Text('Detect system audio (threshold: ${_audioThreshold.toStringAsFixed(4)})', 
+                              style: const TextStyle(fontSize: 11)),
+                            value: _monitorAudio,
+                            onChanged: _toggleAudioMonitoring,
+                          ),
+                          
+                          if (_monitorAudio)
+                            Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text('Audio Threshold:', style: TextStyle(fontSize: 11)),
+                                  Row(
+                                    children: [
+                                      Expanded(
+                                        child: Slider(
+                                          value: _audioThreshold,
+                                          min: 0.0001,
+                                          max: 0.1,
+                                          divisions: 100,
+                                          label: _audioThreshold.toStringAsFixed(4),
+                                          onChanged: _updateAudioThreshold,
+                                        ),
+                                      ),
+                                      Text(_audioThreshold.toStringAsFixed(4), 
+                                        style: const TextStyle(fontSize: 10)),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                          
+                          SwitchListTile(
+                            dense: true,
+                            title: const Text('Controller Monitoring', style: TextStyle(fontSize: 13)),
+                            subtitle: const Text('Detect XInput controllers (Xbox, etc.)', 
+                              style: TextStyle(fontSize: 11)),
+                            value: _monitorControllers,
+                            onChanged: _toggleControllerMonitoring,
+                          ),
+                          
+                          SwitchListTile(
+                            dense: true,
+                            title: const Text('HID Device Monitoring', style: TextStyle(fontSize: 13)),
+                            subtitle: const Text('Detect all HID input devices (wheels, tablets, etc.)', 
+                              style: TextStyle(fontSize: 11)),
+                            value: _monitorHIDDevices,
+                            onChanged: _toggleHIDMonitoring,
+                          ),
+                          
+                          const Divider(),
+                          _buildSectionTitle('Screenshot Settings'),
+                          
+                          SwitchListTile(
+                            dense: true,
+                            title: const Text('Auto Screenshot', style: TextStyle(fontSize: 13)),
+                            subtitle: Text('Every $_screenshotInterval seconds', 
+                              style: const TextStyle(fontSize: 11)),
                             value: _autoScreenshot,
                             onChanged: _toggleAutoScreenshot,
                           ),
+                          
                           SwitchListTile(
-                            title: const Text('Active Window Only'),
+                            dense: true,
+                            title: const Text('Active Window Only', style: TextStyle(fontSize: 13)),
                             value: _activeWindowOnly,
                             onChanged: (value) {
                               setState(() {
@@ -247,18 +428,19 @@ class _MyAppState extends State<MyApp> {
                               });
                             },
                           ),
+                          
                           Padding(
                             padding: const EdgeInsets.symmetric(horizontal: 16.0),
                             child: Row(
                               children: [
-                                const Text('Interval: '),
+                                const Text('Interval: ', style: TextStyle(fontSize: 11)),
                                 Expanded(
                                   child: Slider(
                                     value: _screenshotInterval.toDouble(),
                                     min: 5,
                                     max: 60,
                                     divisions: 11,
-                                    label: '$_screenshotInterval',
+                                    label: '$_screenshotInterval sec',
                                     onChanged: _autoScreenshot
                                         ? null
                                         : (value) {
@@ -268,102 +450,193 @@ class _MyAppState extends State<MyApp> {
                                           },
                                   ),
                                 ),
+                                Text('$_screenshotInterval', style: const TextStyle(fontSize: 10)),
                               ],
                             ),
                           ),
+                          
                           const Divider(),
-                          Form(
-                              child: Row(
-                            children: [
-                              Expanded(
-                                child: TextFormField(
-                                  controller: textController,
-                                  decoration: const InputDecoration(
-                                      label: Text('Time in second')),
-                                  keyboardType: TextInputType.number,
+                          _buildSectionTitle('Idle Timeout Settings'),
+                          
+                          Padding(
+                            padding: const EdgeInsets.all(8.0),
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: TextFormField(
+                                    controller: textController,
+                                    decoration: const InputDecoration(
+                                      labelText: 'Timeout (seconds)',
+                                      border: OutlineInputBorder(),
+                                      isDense: true,
+                                    ),
+                                    style: const TextStyle(fontSize: 12),
+                                    keyboardType: TextInputType.number,
+                                  ),
                                 ),
-                              ),
-                              ElevatedButton(
-                                onPressed: () async {
-                                  final seconds = int.tryParse(textController.text);
-                                  if (seconds != null) {
-                                    await _windowFocusPlugin.setIdleThreshold(
-                                        duration: Duration(seconds: seconds));
-                                    _messangerKey.currentState?.showSnackBar(
-                                      SnackBar(content: Text('Idle threshold set to $seconds seconds')),
-                                    );
-                                  } else {
-                                    Duration duration = await _windowFocusPlugin.idleThreshold;
-                                    print('Current threshold: $duration');
-                                  }
-                                },
-                                child: const Text('Save timeOut'),
-                              )
-                            ],
-                          ))
+                                const SizedBox(width: 8),
+                                ElevatedButton(
+                                  onPressed: () async {
+                                    final seconds = int.tryParse(textController.text);
+                                    if (seconds != null) {
+                                      await _windowFocusPlugin.setIdleThreshold(
+                                          duration: Duration(seconds: seconds));
+                                      _logActivity('Idle timeout set to $seconds seconds');
+                                      _messangerKey.currentState?.showSnackBar(
+                                        SnackBar(content: Text('Idle threshold set to $seconds seconds')),
+                                      );
+                                    } else {
+                                      Duration duration = await _windowFocusPlugin.idleThreshold;
+                                      _logActivity('Current timeout: ${duration.inSeconds} seconds');
+                                    }
+                                  },
+                                  child: const Text('Set', style: TextStyle(fontSize: 12)),
+                                ),
+                              ],
+                            ),
+                          ),
+                          
+                          const Divider(),
+                          _buildSectionTitle('Testing Tips'),
+                          _buildInfoCard([
+                            '🎮 Controller: Press any button on Xbox controller',
+                            '🎵 Audio: Play music/video to test audio detection',
+                            '🖱️ HID: Use racing wheel, drawing tablet, or custom USB device',
+                            '⌨️ Keyboard/Mouse: Default input detection',
+                            '⏱️ Wait for idle timeout to see inactive state',
+                          ], color: Colors.blue.shade50),
                         ],
                       ),
                     ),
                   ),
+                  
+                  // Right Panel - Logs and Stats
                   Expanded(
                     child: Column(
                       children: [
-                        const Padding(
-                          padding: EdgeInsets.symmetric(vertical: 8.0),
-                          child: Text('App Usage', style: TextStyle(fontWeight: FontWeight.bold)),
-                        ),
                         Expanded(
                           flex: 3,
-                          child: Container(
-                            padding: const EdgeInsets.all(8.0),
-                            margin: const EdgeInsets.only(right: 8, bottom: 8),
-                            decoration: const BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.all(Radius.circular(24)),
-                            ),
-                            child: ListView.builder(
-                              itemBuilder: (context, index) {
-                                final item = items[index];
-                                return ListTile(
-                                  title: Text(item.appName, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                                  subtitle: item.windowTitle.isNotEmpty && item.windowTitle != item.appName 
-                                    ? Text(item.windowTitle, style: const TextStyle(fontSize: 10)) 
-                                    : null,
-                                  trailing: Text(formatDurationToHHMM(item.timeUse), style: const TextStyle(fontSize: 12)),
-                                  visualDensity: VisualDensity.compact,
-                                );
-                              },
-                              itemCount: items.length,
-                            ),
+                          child: Column(
+                            children: [
+                              const Padding(
+                                padding: EdgeInsets.all(8.0),
+                                child: Text('Activity Detection Logs', 
+                                  style: TextStyle(fontWeight: FontWeight.bold)),
+                              ),
+                              Expanded(
+                                child: Container(
+                                  padding: const EdgeInsets.all(8.0),
+                                  margin: const EdgeInsets.only(right: 8),
+                                  decoration: BoxDecoration(
+                                    color: Colors.grey.shade100,
+                                    borderRadius: const BorderRadius.all(Radius.circular(12)),
+                                    border: Border.all(color: Colors.grey.shade300),
+                                  ),
+                                  child: ListView.builder(
+                                    itemBuilder: (context, index) {
+                                      final log = _activityLogs[index];
+                                      final isActive = log.contains('ACTIVE') && !log.contains('INACTIVE');
+                                      return Padding(
+                                        padding: const EdgeInsets.symmetric(vertical: 2.0),
+                                        child: Text(
+                                          log,
+                                          style: TextStyle(
+                                            fontSize: 10,
+                                            fontFamily: 'monospace',
+                                            color: isActive ? Colors.green.shade700 : Colors.blueGrey,
+                                            fontWeight: isActive ? FontWeight.bold : FontWeight.normal,
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                    itemCount: _activityLogs.length,
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
                         ),
-                        const Padding(
-                          padding: EdgeInsets.symmetric(vertical: 8.0),
-                          child: Text('Screenshot Logs', style: TextStyle(fontWeight: FontWeight.bold)),
-                        ),
+                        
                         Expanded(
                           flex: 2,
-                          child: Container(
-                            padding: const EdgeInsets.all(8.0),
-                            margin: const EdgeInsets.only(right: 8, bottom: 8),
-                            decoration: const BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.all(Radius.circular(24)),
-                            ),
-                            child: ListView.builder(
-                              itemBuilder: (context, index) {
-                                return Padding(
-                                  padding: const EdgeInsets.symmetric(vertical: 4.0),
-                                  child: Text(
-                                    _screenshotLogs[index],
-                                    style: const TextStyle(fontSize: 11, color: Colors.blueGrey),
+                          child: Column(
+                            children: [
+                              const Padding(
+                                padding: EdgeInsets.all(8.0),
+                                child: Text('App Usage Stats', 
+                                  style: TextStyle(fontWeight: FontWeight.bold)),
+                              ),
+                              Expanded(
+                                child: Container(
+                                  padding: const EdgeInsets.all(8.0),
+                                  margin: const EdgeInsets.only(right: 8),
+                                  decoration: BoxDecoration(
+                                    color: Colors.white,
+                                    borderRadius: const BorderRadius.all(Radius.circular(12)),
+                                    border: Border.all(color: Colors.grey.shade300),
                                   ),
-                                );
-                              },
-                              itemCount: _screenshotLogs.length,
-                            ),
+                                  child: ListView.builder(
+                                    itemBuilder: (context, index) {
+                                      final item = items[index];
+                                      return ListTile(
+                                        dense: true,
+                                        visualDensity: VisualDensity.compact,
+                                        title: Text(item.appName, 
+                                          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                                        subtitle: item.windowTitle.isNotEmpty && item.windowTitle != item.appName 
+                                          ? Text(item.windowTitle, 
+                                              style: const TextStyle(fontSize: 9),
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis) 
+                                          : null,
+                                        trailing: Text(formatDurationToHHMM(item.timeUse), 
+                                          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                                      );
+                                    },
+                                    itemCount: items.length,
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
                         ),
+                        
+                        if (_screenshotLogs.isNotEmpty)
+                          Expanded(
+                            flex: 1,
+                            child: Column(
+                              children: [
+                                const Padding(
+                                  padding: EdgeInsets.all(8.0),
+                                  child: Text('Screenshot Logs', 
+                                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                                ),
+                                Expanded(
+                                  child: Container(
+                                    padding: const EdgeInsets.all(8.0),
+                                    margin: const EdgeInsets.only(right: 8, bottom: 8),
+                                    decoration: BoxDecoration(
+                                      color: Colors.amber.shade50,
+                                      borderRadius: const BorderRadius.all(Radius.circular(12)),
+                                      border: Border.all(color: Colors.amber.shade200),
+                                    ),
+                                    child: ListView.builder(
+                                      itemBuilder: (context, index) {
+                                        return Padding(
+                                          padding: const EdgeInsets.symmetric(vertical: 2.0),
+                                          child: Text(
+                                            _screenshotLogs[index],
+                                            style: const TextStyle(fontSize: 9, color: Colors.black87),
+                                          ),
+                                        );
+                                      },
+                                      itemCount: _screenshotLogs.length,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
                       ],
                     ),
                   )
@@ -372,39 +645,60 @@ class _MyAppState extends State<MyApp> {
             )
           ],
         ),
-        bottomNavigationBar: TextButton(
-            child:
-                const Text('Subscribe to my telegram channel @kotelnikoff_dev'),
-            onPressed: () async {
-              if (await canLaunchUrl(
-                  Uri.parse('https://telegram.me/kotelnikoff_dev'))) {
-                await launchUrl(
-                    Uri.parse('https://telegram.me/kotelnikoff_dev'));
-              } else {
-                _messangerKey.currentState!.showSnackBar(const SnackBar(
-                  content: Text('Oh! My Telegram Chanel @kotelnikoff_dev!'),
-                ));
-              }
-            }),
+        bottomNavigationBar: Container(
+          padding: const EdgeInsets.all(8),
+          color: Colors.grey.shade200,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text('Total: ${_formatDuration(allTime)}', 
+                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+              TextButton(
+                child: const Text('Subscribe @kotelnikoff_dev', style: TextStyle(fontSize: 11)),
+                onPressed: () async {
+                  if (await canLaunchUrl(Uri.parse('https://telegram.me/kotelnikoff_dev'))) {
+                    await launchUrl(Uri.parse('https://telegram.me/kotelnikoff_dev'));
+                  }
+                },
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
 
-  void addInactivityThreshold(BuildContext context) async {
-    try {
-      Duration duration = await _windowFocusPlugin.idleThreshold;
-      duration += const Duration(seconds: 5);
-      _windowFocusPlugin.setIdleThreshold(duration: duration);
-
-      _messangerKey.currentState!.showSnackBar(SnackBar(
-        content: Text(
-            'Great! new inactivity threshold ${duration.inSeconds} seconds'),
-      ));
-    } catch (e, s) {
-      print(e);
-      print(s);
-    }
+  Widget _buildSectionTitle(String title) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 8, bottom: 4),
+      child: Text(
+        title,
+        style: const TextStyle(
+          fontSize: 13,
+          fontWeight: FontWeight.bold,
+          color: Colors.blue,
+        ),
+      ),
+    );
   }
+
+  Widget _buildInfoCard(List<String> items, {Color? color}) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color ?? Colors.grey.shade100,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: items.map((item) => Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Text(item, style: const TextStyle(fontSize: 11)),
+        )).toList(),
+      ),
+    );
+  }
+
   String formatDurationToHHMM(Duration duration) {
     final hours = duration.inHours;
     final minutes = duration.inMinutes.remainder(60);
@@ -427,6 +721,7 @@ class _MyAppState extends State<MyApp> {
   @override
   void dispose() {
     _timer.cancel();
+    _screenshotTimer?.cancel();
     _windowFocusPlugin.dispose();
     super.dispose();
   }
@@ -453,12 +748,14 @@ class TimeAppDto {
 
   @override
   int get hashCode {
-    return timeUse.hashCode^appName.hashCode^windowTitle.hashCode;
+    return timeUse.hashCode ^ appName.hashCode ^ windowTitle.hashCode;
   }
 
   @override
   bool operator ==(Object other) {
-    return other is TimeAppDto && other.timeUse == timeUse && other.appName == appName && other.windowTitle == windowTitle;
-
+    return other is TimeAppDto && 
+           other.timeUse == timeUse && 
+           other.appName == appName && 
+           other.windowTitle == windowTitle;
   }
 }
