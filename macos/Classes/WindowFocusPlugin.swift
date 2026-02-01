@@ -398,7 +398,7 @@ public class IdleTracker: NSObject {
     }
 
     private func initializeHIDDevices() {
-        guard monitorHIDDevices else { return }
+        guard monitorHIDDevices || monitorControllers else { return }
         
         hidManager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         guard let manager = hidManager else {
@@ -408,17 +408,9 @@ public class IdleTracker: NSObject {
             return
         }
 
-        // Match all HID devices except audio
-        let matchingDict: [[String: Any]] = [
-            // Game controllers
-            [kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop, kIOHIDDeviceUsageKey: kHIDUsage_GD_GamePad],
-            [kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop, kIOHIDDeviceUsageKey: kHIDUsage_GD_Joystick],
-            // Additional input devices
-            [kIOHIDDeviceUsagePageKey: kHIDPage_Digitizer],
-            [kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop, kIOHIDDeviceUsageKey: kHIDUsage_GD_MultiAxisController]
-        ]
-        
-        IOHIDManagerSetDeviceMatchingMultiple(manager, matchingDict as CFArray)
+        // Match ALL HID devices - we'll filter out audio devices in the callback
+        // This is more reliable than trying to match specific device types
+        IOHIDManagerSetDeviceMatching(manager, nil)
         
         IOHIDManagerRegisterDeviceMatchingCallback(manager, { context, result, sender, device in
             guard let context = context else { return }
@@ -433,23 +425,88 @@ public class IdleTracker: NSObject {
         }, UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()))
         
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
-        IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         
         if debugMode {
-            print("[WindowFocus] HID manager initialized")
+            if openResult == kIOReturnSuccess {
+                print("[WindowFocus] HID manager initialized successfully")
+            } else {
+                print("[WindowFocus] HID manager open failed with error: \(openResult)")
+            }
         }
     }
 
     private func handleHIDDeviceAdded(_ device: IOHIDDevice) {
-        // Check if it's an audio device and skip
-        if let usagePage = IOHIDDeviceGetProperty(device, kIOHIDDeviceUsagePageKey as CFString) as? Int {
-            // Skip telephony (0x0B) and consumer (0x0C) devices which often include audio
-            if usagePage == 0x0B || usagePage == 0x0C {
-                if debugMode {
-                    print("[WindowFocus] Skipping audio HID device with usage page: 0x\(String(usagePage, radix: 16))")
-                }
-                return
+        // Get device properties for filtering
+        let usagePage = IOHIDDeviceGetProperty(device, kIOHIDDeviceUsagePageKey as CFString) as? Int ?? 0
+        let usage = IOHIDDeviceGetProperty(device, kIOHIDDeviceUsageKey as CFString) as? Int ?? 0
+        let vendorID = IOHIDDeviceGetProperty(device, kIOHIDVendorIDKey as CFString) as? Int ?? 0
+        let productID = IOHIDDeviceGetProperty(device, kIOHIDProductIDKey as CFString) as? Int ?? 0
+        let productName = IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String ?? "Unknown"
+        
+        if debugMode {
+            print("[WindowFocus] HID device found: \(productName)")
+            print("  VID: 0x\(String(vendorID, radix: 16)), PID: 0x\(String(productID, radix: 16))")
+            print("  Usage Page: 0x\(String(usagePage, radix: 16)), Usage: 0x\(String(usage, radix: 16))")
+        }
+        
+        // Filter out devices we don't want to monitor
+        var shouldMonitor = false
+        
+        // Check if it's an audio/microphone device (exclude these)
+        let isAudioDevice = (usagePage == 0x0B || // Telephony (headsets, microphones)
+                            usagePage == 0x0C)     // Consumer (audio controls)
+        
+        // Check if it's a keyboard or mouse (already handled by event tap, but won't hurt)
+        let isKeyboard = (usagePage == 0x01 && usage == 0x06)
+        let isMouse = (usagePage == 0x01 && usage == 0x02)
+        
+        // Game controllers and gamepads
+        let isGameController = (usagePage == 0x01 && (usage == 0x04 || usage == 0x05 || usage == 0x08))
+        
+        // Digitizers (drawing tablets)
+        let isDigitizer = (usagePage == 0x0D)
+        
+        // Multi-axis controllers (racing wheels, flight sticks)
+        let isMultiAxisController = (usagePage == 0x01 && usage == 0x08)
+        
+        // Generic Desktop devices that aren't keyboard/mouse
+        let isOtherDesktopDevice = (usagePage == 0x01 && !isKeyboard && !isMouse)
+        
+        // Decide if we should monitor this device
+        if monitorControllers && isGameController {
+            shouldMonitor = true
+            if debugMode {
+                print("[WindowFocus] → Game controller detected, will monitor")
             }
+        } else if monitorHIDDevices {
+            // For HID monitoring, accept most input devices except audio
+            if !isAudioDevice {
+                shouldMonitor = true
+                if debugMode {
+                    if isDigitizer {
+                        print("[WindowFocus] → Drawing tablet/digitizer detected, will monitor")
+                    } else if isMultiAxisController {
+                        print("[WindowFocus] → Multi-axis controller detected, will monitor")
+                    } else if isOtherDesktopDevice {
+                        print("[WindowFocus] → Generic input device detected, will monitor")
+                    } else {
+                        print("[WindowFocus] → HID input device detected, will monitor")
+                    }
+                }
+            } else {
+                if debugMode {
+                    print("[WindowFocus] → Audio device, skipping")
+                }
+            }
+        } else {
+            if debugMode {
+                print("[WindowFocus] → Monitoring disabled for this device type")
+            }
+        }
+        
+        if !shouldMonitor {
+            return
         }
         
         hidDevices.append(device)
@@ -463,9 +520,7 @@ public class IdleTracker: NSObject {
         }, UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()))
         
         if debugMode {
-            let vendorID = IOHIDDeviceGetProperty(device, kIOHIDVendorIDKey as CFString) as? Int ?? 0
-            let productID = IOHIDDeviceGetProperty(device, kIOHIDProductIDKey as CFString) as? Int ?? 0
-            print("[WindowFocus] HID device added: VID=0x\(String(vendorID, radix: 16)) PID=0x\(String(productID, radix: 16))")
+            print("[WindowFocus] ✓ Successfully registered HID device (\(hidDevices.count) total)")
         }
     }
 
@@ -481,13 +536,15 @@ public class IdleTracker: NSObject {
     }
 
     private func handleHIDInput(from devicePointer: UnsafeMutableRawPointer) {
-        if !monitorHIDDevices { return }
+        if !monitorHIDDevices && !monitorControllers { return }
         
         let device = Unmanaged<IOHIDDevice>.fromOpaque(devicePointer).takeUnretainedValue()
         
         if debugMode {
-            print("[WindowFocus] HID input detected")
+            let productName = IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String ?? "Unknown"
+            print("[WindowFocus] HID input detected from: \(productName)")
         }
+        
         userDidInteract()
     }
 
@@ -728,7 +785,25 @@ public class IdleTracker: NSObject {
         
         if debugMode {
             print("[WindowFocus] HID device monitoring set to \(enabled)")
+            if enabled {
+                // Print diagnostic info
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                    self?.printConnectedDevices()
+                }
+            }
         }
+    }
+    
+    private func printConnectedDevices() {
+        print("[WindowFocus] === Currently Monitored Devices ===")
+        print("[WindowFocus] Total devices: \(hidDevices.count)")
+        for (index, device) in hidDevices.enumerated() {
+            let productName = IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String ?? "Unknown"
+            let vendorID = IOHIDDeviceGetProperty(device, kIOHIDVendorIDKey as CFString) as? Int ?? 0
+            let productID = IOHIDDeviceGetProperty(device, kIOHIDProductIDKey as CFString) as? Int ?? 0
+            print("[WindowFocus] [\(index)] \(productName) (VID: 0x\(String(vendorID, radix: 16)), PID: 0x\(String(productID, radix: 16)))")
+        }
+        print("[WindowFocus] ==================================")
     }
 
     private func closeHIDDevices() {
