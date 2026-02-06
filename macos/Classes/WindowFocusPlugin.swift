@@ -32,7 +32,7 @@ public class WindowFocusPlugin: NSObject, FlutterPlugin {
             
         case "setInactivityTimeOut":
             if let args = call.arguments as? [String: Any],
-               let threshold = args["inactivityTimeOut"] as? TimeInterval {
+            let threshold = args["inactivityTimeOut"] as? TimeInterval {
                 idleTracker?.setIdleThreshold(threshold / 1000.0)
                 result(nil)
             } else {
@@ -48,7 +48,7 @@ public class WindowFocusPlugin: NSObject, FlutterPlugin {
             
         case "setDebugMode":
             if let args = call.arguments as? [String: Any],
-               let debug = args["debug"] as? Bool {
+            let debug = args["debug"] as? Bool {
                 idleTracker?.setDebugMode(debug)
                 result(nil)
             } else {
@@ -57,7 +57,7 @@ public class WindowFocusPlugin: NSObject, FlutterPlugin {
             
         case "setControllerMonitoring":
             if let args = call.arguments as? [String: Any],
-               let enabled = args["enabled"] as? Bool {
+            let enabled = args["enabled"] as? Bool {
                 idleTracker?.setControllerMonitoring(enabled)
                 result(nil)
             } else {
@@ -66,7 +66,7 @@ public class WindowFocusPlugin: NSObject, FlutterPlugin {
             
         case "setAudioMonitoring":
             if let args = call.arguments as? [String: Any],
-               let enabled = args["enabled"] as? Bool {
+            let enabled = args["enabled"] as? Bool {
                 idleTracker?.setAudioMonitoring(enabled)
                 result(nil)
             } else {
@@ -75,7 +75,7 @@ public class WindowFocusPlugin: NSObject, FlutterPlugin {
             
         case "setAudioThreshold":
             if let args = call.arguments as? [String: Any],
-               let threshold = args["threshold"] as? Double {
+            let threshold = args["threshold"] as? Double {
                 idleTracker?.setAudioThreshold(Float(threshold))
                 result(nil)
             } else {
@@ -84,7 +84,7 @@ public class WindowFocusPlugin: NSObject, FlutterPlugin {
             
         case "setHIDMonitoring":
             if let args = call.arguments as? [String: Any],
-               let enabled = args["enabled"] as? Bool {
+            let enabled = args["enabled"] as? Bool {
                 idleTracker?.setHIDMonitoring(enabled)
                 result(nil)
             } else {
@@ -93,7 +93,7 @@ public class WindowFocusPlugin: NSObject, FlutterPlugin {
             
         case "takeScreenshot":
             if let args = call.arguments as? [String: Any],
-               let activeWindowOnly = args["activeWindowOnly"] as? Bool {
+            let activeWindowOnly = args["activeWindowOnly"] as? Bool {
                 takeScreenshot(activeWindowOnly: activeWindowOnly, result: result)
             } else {
                 takeScreenshot(activeWindowOnly: false, result: result)
@@ -106,8 +106,66 @@ public class WindowFocusPlugin: NSObject, FlutterPlugin {
             requestScreenRecordingPermission()
             result(nil)
             
+        // NEW: Input Monitoring Permission
+        case "checkInputMonitoringPermission":
+            result(checkInputMonitoringPermission())
+            
+        case "requestInputMonitoringPermission":
+            requestInputMonitoringPermission()
+            result(nil)
+
+        case "openInputMonitoringSettings":
+            openInputMonitoringSettings()
+            result(nil)
+                
+        // NEW: Check all permissions at once
+        case "checkAllPermissions":
+            let permissions: [String: Bool] = [
+                "screenRecording": checkScreenRecordingPermission(),
+                "inputMonitoring": checkInputMonitoringPermission()
+            ]
+            result(permissions)
+            
         default:
             result(FlutterMethodNotImplemented)
+        }
+    }
+    private func checkInputMonitoringPermission() -> Bool {
+        if #available(macOS 10.15, *) {
+            // IOHIDCheckAccess returns the current authorization status
+            let status = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
+            switch status {
+            case kIOHIDAccessTypeGranted:
+                return true
+            case kIOHIDAccessTypeDenied, kIOHIDAccessTypeUnknown:
+                return false
+            default:
+                return false
+            }
+        }
+        // Before 10.15, Input Monitoring didn't exist as a separate permission
+        return true
+    }
+
+    private func requestInputMonitoringPermission() {
+        if #available(macOS 10.15, *) {
+            let status = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
+            
+            if status == kIOHIDAccessTypeUnknown {
+                // Request permission - this triggers the system dialog
+                IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+            } else if status == kIOHIDAccessTypeDenied {
+                // Already denied - open System Settings
+                openInputMonitoringSettings()
+            }
+            // If granted, do nothing
+        }
+    }
+
+
+    private func openInputMonitoringSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
+            NSWorkspace.shared.open(url)
         }
     }
 

@@ -1,61 +1,11 @@
-// window_focus_method_channel.dart
 import 'dart:async';
 import 'package:flutter/services.dart';
 import 'domain/domain.dart';
 
 /// The WindowFocus plugin provides functionality for tracking user activity
-/// and the currently active window on the Windows and macOS platforms. It is useful for applications
-/// that need to monitor user interaction with the system.
+/// and the currently active window on the Windows and macOS platforms.
 class WindowFocus {
   /// Creates an instance of `WindowFocus` for tracking user activity and window focus.
-  ///
-  /// The constructor allows enabling debug mode and setting the user inactivity timeout
-  /// when creating an instance.
-  ///
-  /// - [debug]: If `true`, the plugin will output debug messages to the console.
-  ///   Useful for diagnosing plugin behavior during development.
-  /// - [duration]: The user inactivity timeout after which the plugin sends an event
-  ///   indicating that the user is inactive. Default is 1 second.
-  /// - [monitorAudio]: If `true`, system audio playback will be monitored to prevent
-  ///   idle state when watching videos or listening to music. Default is `true`.
-  /// - [monitorControllers]: If `true`, XInput controllers (Xbox controllers) will be
-  ///   monitored for input. Default is `true`.
-  /// - [monitorHIDDevices]: If `true`, ALL HID input devices (except microphones) will be
-  ///   monitored. This includes racing wheels, drawing tablets, custom USB devices, etc.
-  ///   Default is `true`.
-  /// - [audioThreshold]: The minimum audio level (0.0 to 1.0) to consider as activity.
-  ///   Default is 0.001. Lower values are more sensitive.
-  ///
-  /// Example usage:
-  ///
-  /// Enable debug mode:
-  /// ```dart
-  /// final windowFocus = WindowFocus(debug: true);
-  /// ```
-  ///
-  /// Set a custom inactivity timeout:
-  /// ```dart
-  /// final windowFocus = WindowFocus(duration: Duration(seconds: 30));
-  /// ```
-  ///
-  /// Enable all monitoring with custom settings:
-  /// ```dart
-  /// final windowFocus = WindowFocus(
-  ///   debug: true,
-  ///   duration: Duration(seconds: 10),
-  ///   monitorAudio: true,
-  ///   monitorControllers: true,
-  ///   monitorHIDDevices: true,
-  ///   audioThreshold: 0.002,
-  /// );
-  /// ```
-  ///
-  /// Disable audio monitoring (e.g., for gaming-only apps):
-  /// ```dart
-  /// final windowFocus = WindowFocus(
-  ///   monitorAudio: false,
-  /// );
-  /// ```
   WindowFocus({
     bool debug = false,
     Duration duration = const Duration(seconds: 1),
@@ -116,16 +66,15 @@ class WindowFocus {
   Stream<bool> get onUserActiveChanged => _userActiveController.stream;
 
   /// Takes a screenshot.
-  ///
-  /// - [activeWindowOnly]: If `true`, only the currently focused window will be captured.
-  ///   If `false`, the entire screen will be captured. Default is `false`.
-  ///
-  /// Returns a `Uint8List` containing the image data in PNG format.
   Future<Uint8List?> takeScreenshot({bool activeWindowOnly = false}) async {
     return await _channel.invokeMethod<Uint8List>('takeScreenshot', {
       'activeWindowOnly': activeWindowOnly,
     });
   }
+
+  // ============================================================
+  // SCREEN RECORDING PERMISSION
+  // ============================================================
 
   /// Checks if the application has permission to record the screen.
   ///
@@ -144,16 +93,95 @@ class WindowFocus {
     await _channel.invokeMethod('requestScreenRecordingPermission');
   }
 
-  /// Sets the user inactivity timeout.
+  // ============================================================
+  // INPUT MONITORING PERMISSION (NEW)
+  // ============================================================
+
+  /// Checks if the application has Input Monitoring permission.
   ///
-  /// If the user is inactive for the specified duration, the plugin sends an event
-  /// indicating user inactivity.
+  /// On macOS 10.15+, this permission is required to monitor keyboard and mouse
+  /// input from other applications. Without this permission, the event tap will
+  /// fail to capture input when other apps are in focus.
   ///
-  /// - [duration]: The time in milliseconds after which the user is considered inactive.
+  /// Returns `true` if permission is granted, `false` otherwise.
+  /// On macOS versions before 10.15, always returns `true` as this permission
+  /// didn't exist.
   ///
   /// ```dart
-  /// await _windowFocus.setIdleThreshold(Duration(seconds: 10));
+  /// final hasPermission = await _windowFocus.checkInputMonitoringPermission();
+  /// if (!hasPermission) {
+  ///   await _windowFocus.requestInputMonitoringPermission();
+  /// }
   /// ```
+  Future<bool> checkInputMonitoringPermission() async {
+    return await _channel
+            .invokeMethod<bool>('checkInputMonitoringPermission') ??
+        false;
+  }
+
+  /// Requests Input Monitoring permission.
+  ///
+  /// On macOS 10.15+, this will either:
+  /// - Show the system permission dialog (if permission hasn't been requested yet)
+  /// - Open System Settings/Preferences to the Input Monitoring section (if already denied)
+  ///
+  /// **Important**: After the user grants permission, the application typically
+  /// needs to be restarted for the event tap to work properly.
+  ///
+  /// ```dart
+  /// await _windowFocus.requestInputMonitoringPermission();
+  /// // Show a message to user to restart the app after granting permission
+  /// ```
+  Future<void> requestInputMonitoringPermission() async {
+    await _channel.invokeMethod('requestInputMonitoringPermission');
+  }
+
+  /// Opens the Input Monitoring section in System Settings/Preferences.
+  ///
+  /// This is useful when you want to direct users to manually enable the permission
+  /// without triggering the system permission request dialog.
+  ///
+  /// ```dart
+  /// await _windowFocus.openInputMonitoringSettings();
+  /// ```
+  Future<void> openInputMonitoringSettings() async {
+    await _channel.invokeMethod('openInputMonitoringSettings');
+  }
+
+  // ============================================================
+  // CHECK ALL PERMISSIONS
+  // ============================================================
+
+  /// Checks all required permissions at once.
+  ///
+  /// Returns a [PermissionStatus] object containing the status of all permissions.
+  /// This is more efficient than calling each check individually.
+  ///
+  /// ```dart
+  /// final permissions = await _windowFocus.checkAllPermissions();
+  /// if (!permissions.inputMonitoring) {
+  ///   // Handle missing input monitoring permission
+  /// }
+  /// if (!permissions.screenRecording) {
+  ///   // Handle missing screen recording permission
+  /// }
+  /// ```
+  Future<PermissionStatus> checkAllPermissions() async {
+    final result = await _channel.invokeMethod<Map>('checkAllPermissions');
+    if (result != null) {
+      return PermissionStatus(
+        screenRecording: result['screenRecording'] as bool? ?? false,
+        inputMonitoring: result['inputMonitoring'] as bool? ?? false,
+      );
+    }
+    return PermissionStatus(screenRecording: false, inputMonitoring: false);
+  }
+
+  // ============================================================
+  // IDLE THRESHOLD SETTINGS
+  // ============================================================
+
+  /// Sets the user inactivity timeout.
   Future<void> setIdleThreshold({required Duration duration}) async {
     await _channel.invokeMethod('setInactivityTimeOut', {
       'inactivityTimeOut': duration.inMilliseconds,
@@ -161,31 +189,17 @@ class WindowFocus {
   }
 
   /// Returns the currently set inactivity timeout.
-  ///
-  /// Returns: A `Duration` that specifies the time after which the user is considered inactive.
-  ///
-  /// ```dart
-  /// final timeout = await _windowFocus.getIdleThreshold();
-  /// print('Inactivity timeout: ${timeout.inSeconds} seconds');
-  /// ```
   Future<Duration> get idleThreshold async {
     final res = await _channel.invokeMethod<int>('getIdleThreshold');
     print(res);
     return Duration(milliseconds: res ?? 60);
   }
 
+  // ============================================================
+  // DEBUG AND MONITORING SETTINGS
+  // ============================================================
+
   /// Enables or disables debug mode for the plugin.
-  ///
-  /// When debug mode is enabled, additional logs are printed to the console,
-  /// allowing developers to observe the internal behavior of the plugin, such as
-  /// user activity changes or active window updates.
-  ///
-  /// - [value]: A `bool` that determines whether debug mode is enabled (`true`) or disabled (`false`).
-  ///
-  /// ```dart
-  /// await _windowFocus.setDebug(true);
-  /// print('Debug mode enabled');
-  /// ```
   Future<void> setDebug(bool value) async {
     _debug = value;
     await _channel.invokeMethod('setDebugMode', {
@@ -194,21 +208,6 @@ class WindowFocus {
   }
 
   /// Enables or disables controller/gamepad input monitoring.
-  ///
-  /// When enabled, the plugin will detect input from XInput-compatible controllers
-  /// (Xbox controllers, compatible gamepads) and treat them as user activity.
-  /// This is enabled by default.
-  ///
-  /// - [enabled]: A `bool` that determines whether controller monitoring is enabled (`true`) or disabled (`false`).
-  ///   Default is `true`.
-  ///
-  /// ```dart
-  /// // Enable controller monitoring
-  /// await _windowFocus.setControllerMonitoring(true);
-  ///
-  /// // Disable if you don't want controllers to prevent idle state
-  /// await _windowFocus.setControllerMonitoring(false);
-  /// ```
   Future<void> setControllerMonitoring(bool enabled) async {
     await _channel.invokeMethod('setControllerMonitoring', {
       'enabled': enabled,
@@ -216,21 +215,6 @@ class WindowFocus {
   }
 
   /// Enables or disables system audio monitoring.
-  ///
-  /// When enabled, the plugin will detect system audio playback and treat it as user activity.
-  /// This is useful for preventing idle state when users are watching videos or listening to music.
-  /// This is enabled by default.
-  ///
-  /// - [enabled]: A `bool` that determines whether audio monitoring is enabled (`true`) or disabled (`false`).
-  ///   Default is `true`.
-  ///
-  /// ```dart
-  /// // Enable audio monitoring (default)
-  /// await _windowFocus.setAudioMonitoring(true);
-  ///
-  /// // Disable if you don't want audio to prevent idle state
-  /// await _windowFocus.setAudioMonitoring(false);
-  /// ```
   Future<void> setAudioMonitoring(bool enabled) async {
     await _channel.invokeMethod('setAudioMonitoring', {
       'enabled': enabled,
@@ -238,23 +222,6 @@ class WindowFocus {
   }
 
   /// Sets the audio threshold for detecting user activity.
-  ///
-  /// The threshold determines the minimum audio level (0.0 to 1.0) required to
-  /// consider the system as having active audio playback. Lower values are more
-  /// sensitive and will detect quieter sounds.
-  ///
-  /// - [threshold]: A `double` value between 0.0 and 1.0. Default is 0.001.
-  ///   - 0.001 = Very sensitive (detects almost any audio)
-  ///   - 0.01 = Moderately sensitive
-  ///   - 0.1 = Less sensitive (only detects louder audio)
-  ///
-  /// ```dart
-  /// // Very sensitive - detects even quiet background music
-  /// await _windowFocus.setAudioThreshold(0.001);
-  ///
-  /// // Less sensitive - only detects louder audio
-  /// await _windowFocus.setAudioThreshold(0.05);
-  /// ```
   Future<void> setAudioThreshold(double threshold) async {
     await _channel.invokeMethod('setAudioThreshold', {
       'threshold': threshold,
@@ -262,76 +229,51 @@ class WindowFocus {
   }
 
   /// Enables or disables HID device monitoring.
-  ///
-  /// When enabled, the plugin will detect input from ALL HID (Human Interface Device) input devices
-  /// except microphones and audio devices. This includes game controllers, drawing tablets, 
-  /// custom USB devices, and more. This is enabled by default.
-  ///
-  /// - [enabled]: A `bool` that determines whether HID device monitoring is enabled (`true`) or disabled (`false`).
-  ///   Default is `true`.
-  ///
-  /// Note: HID device detection covers ALL input devices including:
-  /// - Racing wheels (Logitech G29, G920, Thrustmaster, etc.)
-  /// - Flight sticks and HOTAS controllers
-  /// - Game controllers (non-XInput)
-  /// - Drawing tablets (Wacom, Huion, XP-Pen, etc.)
-  /// - Custom USB input devices
-  /// - Stream decks, foot pedals, button boxes, etc.
-  /// 
-  /// Excluded: Microphones and audio HID devices (to avoid detecting voice as activity)
-  ///
-  /// ```dart
-  /// // Enable HID device monitoring (default)
-  /// await _windowFocus.setHIDMonitoring(true);
-  ///
-  /// // Disable if you only want keyboard/mouse/XInput controller detection
-  /// await _windowFocus.setHIDMonitoring(false);
-  /// ```
   Future<void> setHIDMonitoring(bool enabled) async {
     await _channel.invokeMethod('setHIDMonitoring', {
       'enabled': enabled,
     });
   }
 
+  // ============================================================
+  // LISTENERS
+  // ============================================================
+
   /// Adds a listener for active window changes.
-  ///
-  /// The callback is triggered whenever the user switches to a different window.
-  ///
-  /// - [listener]: A function that accepts an `AppWindowDto` object, which contains
-  ///   information about the currently active application.
-  ///
-  /// ```dart
-  /// _windowFocus.addFocusChangeListener((appWindow) {
-  ///   print('Active window: ${appWindow.appName}');
-  /// });
-  /// ```
   StreamSubscription<AppWindowDto> addFocusChangeListener(
       void Function(AppWindowDto) listener) {
     return onFocusChanged.listen(listener);
   }
 
   /// Adds a listener for user activity changes.
-  ///
-  /// The listener is called when the user becomes active (`true`) or inactive (`false`).
-  ///
-  /// - [listener]: A function that accepts a `bool` indicating the user's activity status.
-  ///
-  /// ```dart
-  /// _windowFocus.addUserActiveListener((isActive) {
-  ///   if (isActive) {
-  ///     print('User is active');
-  ///   } else {
-  ///     print('User is inactive');
-  ///   }
-  /// });
-  /// ```
-  StreamSubscription<bool> addUserActiveListener(
-      void Function(bool) listener) {
+  StreamSubscription<bool> addUserActiveListener(void Function(bool) listener) {
     return onUserActiveChanged.listen(listener);
   }
 
   void dispose() {
     _focusChangeController.close();
     _userActiveController.close();
+  }
+}
+
+/// Represents the status of all required permissions.
+class PermissionStatus {
+  /// Whether screen recording permission is granted.
+  final bool screenRecording;
+
+  /// Whether input monitoring permission is granted.
+  final bool inputMonitoring;
+
+  PermissionStatus({
+    required this.screenRecording,
+    required this.inputMonitoring,
+  });
+
+  /// Returns true if all permissions are granted.
+  bool get allGranted => screenRecording && inputMonitoring;
+
+  @override
+  String toString() {
+    return 'PermissionStatus(screenRecording: $screenRecording, inputMonitoring: $inputMonitoring)';
   }
 }
