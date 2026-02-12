@@ -46,7 +46,6 @@ class WindowFocusPlugin : public flutter::Plugin {
   std::optional<std::vector<uint8_t>> TakeScreenshot(bool activeWindowOnly);
 
   // Hook procedures
-  static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
   static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam);
 
   // Input monitoring methods
@@ -61,7 +60,6 @@ class WindowFocusPlugin : public flutter::Plugin {
 
  private:
   static WindowFocusPlugin* instance_;
-  static HHOOK keyboardHook_;
   static HHOOK mouseHook_;
 
   // Thread safety

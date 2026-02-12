@@ -355,7 +355,7 @@ public class IdleTracker: NSObject {
     private var monitorHIDDevices: Bool = true
     private var audioThreshold: Float = 0.001
 
-    // Event tap for keyboard/mouse
+    // Event tap for mouse ONLY (keyboard monitoring removed)
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
 
@@ -382,15 +382,17 @@ public class IdleTracker: NSObject {
     }
 
     private func setupEventTap() {
-        let eventMask = (1 << CGEventType.keyDown.rawValue) | 
-                         (1 << CGEventType.keyUp.rawValue) | 
-                         (1 << CGEventType.flagsChanged.rawValue) | 
-                         (1 << CGEventType.mouseMoved.rawValue) | 
+        // KEYBOARD MONITORING REMOVED - Only monitor mouse events
+        let eventMask = (1 << CGEventType.mouseMoved.rawValue) | 
                          (1 << CGEventType.leftMouseDown.rawValue) | 
-                         (1 << CGEventType.rightMouseDown.rawValue)
+                         (1 << CGEventType.rightMouseDown.rawValue) |
+                         (1 << CGEventType.leftMouseUp.rawValue) |
+                         (1 << CGEventType.rightMouseUp.rawValue) |
+                         (1 << CGEventType.leftMouseDragged.rawValue) |
+                         (1 << CGEventType.rightMouseDragged.rawValue)
         
         if debugMode {
-            print("[WindowFocus] Creating event tap with mask: \(eventMask)")
+            print("[WindowFocus] Creating event tap with mask: \(eventMask) (mouse only - keyboard monitoring disabled)")
         }
 
         guard let eventTap = CGEvent.tapCreate(
@@ -402,7 +404,7 @@ public class IdleTracker: NSObject {
                 if let refcon = refcon {
                     let tracker = Unmanaged<IdleTracker>.fromOpaque(refcon).takeUnretainedValue()
                     if tracker.debugMode {
-                        print("[WindowFocus] EventTap detected event type: \(type.rawValue)")
+                        print("[WindowFocus] EventTap detected mouse event type: \(type.rawValue)")
                     }
                     tracker.userDidInteract()
                 }
@@ -423,7 +425,7 @@ public class IdleTracker: NSObject {
                     if let refcon = refcon {
                         let tracker = Unmanaged<IdleTracker>.fromOpaque(refcon).takeUnretainedValue()
                         if tracker.debugMode {
-                            print("[WindowFocus] EventTap (HID) detected event type: \(type.rawValue)")
+                            print("[WindowFocus] EventTap (HID) detected mouse event type: \(type.rawValue)")
                         }
                         tracker.userDidInteract()
                     }
@@ -434,7 +436,7 @@ public class IdleTracker: NSObject {
                 self.eventTap = eventTapHid
                 setupRunLoopSource(eventTapHid)
                 if debugMode {
-                    print("[WindowFocus] Event tap (HID) created successfully")
+                    print("[WindowFocus] Event tap (HID) created successfully (mouse only)")
                 }
             } else {
                 print("[WindowFocus] Failed to create event tap. Check Accessibility permissions.")
@@ -445,7 +447,7 @@ public class IdleTracker: NSObject {
         self.eventTap = eventTap
         setupRunLoopSource(eventTap)
         if debugMode {
-            print("[WindowFocus] Event tap created successfully")
+            print("[WindowFocus] Event tap created successfully (mouse only)")
         }
     }
 
@@ -515,8 +517,10 @@ public class IdleTracker: NSObject {
         let isAudioDevice = (usagePage == 0x0B || // Telephony (headsets, microphones)
                             usagePage == 0x0C)     // Consumer (audio controls)
         
-        // Check if it's a keyboard or mouse (already handled by event tap, but won't hurt)
+        // Check if it's a keyboard (EXCLUDED - keyboard monitoring removed)
         let isKeyboard = (usagePage == 0x01 && usage == 0x06)
+        
+        // Check if it's a mouse (already handled by event tap, but won't hurt to include)
         let isMouse = (usagePage == 0x01 && usage == 0x02)
         
         // Game controllers and gamepads
@@ -538,14 +542,16 @@ public class IdleTracker: NSObject {
                 print("[WindowFocus] → Game controller detected, will monitor")
             }
         } else if monitorHIDDevices {
-            // For HID monitoring, accept most input devices except audio
-            if !isAudioDevice {
+            // For HID monitoring, accept most input devices except audio and KEYBOARD
+            if !isAudioDevice && !isKeyboard {
                 shouldMonitor = true
                 if debugMode {
                     if isDigitizer {
                         print("[WindowFocus] → Drawing tablet/digitizer detected, will monitor")
                     } else if isMultiAxisController {
                         print("[WindowFocus] → Multi-axis controller detected, will monitor")
+                    } else if isMouse {
+                        print("[WindowFocus] → Mouse detected, will monitor")
                     } else if isOtherDesktopDevice {
                         print("[WindowFocus] → Generic input device detected, will monitor")
                     } else {
@@ -554,7 +560,11 @@ public class IdleTracker: NSObject {
                 }
             } else {
                 if debugMode {
-                    print("[WindowFocus] → Audio device, skipping")
+                    if isAudioDevice {
+                        print("[WindowFocus] → Audio device, skipping")
+                    } else if isKeyboard {
+                        print("[WindowFocus] → Keyboard device, skipping (keyboard monitoring disabled)")
+                    }
                 }
             }
         } else {
@@ -719,10 +729,10 @@ public class IdleTracker: NSObject {
         // Background monitoring is now handled by:
         // 1. HID callbacks for device input
         // 2. Audio timer in initializeAudioMonitoring
-        // 3. Event tap for keyboard/mouse
+        // 3. Event tap for MOUSE ONLY (keyboard removed)
         
         if debugMode {
-            print("[WindowFocus] Input monitoring started")
+            print("[WindowFocus] Input monitoring started (mouse, controllers, audio, HID devices)")
         }
     }
 
@@ -735,11 +745,12 @@ public class IdleTracker: NSObject {
             print("[WindowFocus] Debug: Started tracking with idleThreshold = \(idleThreshold)")
         }
 
-        NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .rightMouseDown, .keyDown, .flagsChanged]) { [weak self] event in
+        // KEYBOARD MONITORING REMOVED - Only monitor mouse events
+        NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .rightMouseDown]) { [weak self] event in
             self?.userDidInteract()
         }
         
-        NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .rightMouseDown, .keyDown, .flagsChanged]) { [weak self] event in
+        NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .rightMouseDown]) { [weak self] event in
             self?.userDidInteract()
             return event
         }

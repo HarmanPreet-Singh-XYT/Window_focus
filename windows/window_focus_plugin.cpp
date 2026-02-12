@@ -41,30 +41,9 @@
 namespace window_focus {
 
 WindowFocusPlugin* WindowFocusPlugin::instance_ = nullptr;
-HHOOK WindowFocusPlugin::keyboardHook_ = nullptr;
 HHOOK WindowFocusPlugin::mouseHook_ = nullptr;
 
 using CallbackMethod = std::function<void(const std::wstring&)>;
-
-LRESULT CALLBACK WindowFocusPlugin::KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
-  if (nCode == HC_ACTION && instance_) {
-    if (instance_->enableDebug_) {
-      std::cout << "[WindowFocus] keyboard hook detected action" << std::endl;
-    }
-    instance_->UpdateLastActivityTime();
-
-    if (!instance_->userIsActive_) {
-      instance_->userIsActive_ = true;
-      if (instance_->channel) {
-        std::lock_guard<std::mutex> lock(instance_->channelMutex_);
-        instance_->channel->InvokeMethod(
-          "onUserActive",
-          std::make_unique<flutter::EncodableValue>("User is active"));
-      }
-    }
-  }
-  return CallNextHookEx(keyboardHook_, nCode, wParam, lParam);
-}
 
 LRESULT CALLBACK WindowFocusPlugin::MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
   if (nCode == HC_ACTION && instance_) {
@@ -91,15 +70,6 @@ void WindowFocusPlugin::SetHooks() {
   }
   HINSTANCE hInstance = GetModuleHandle(nullptr);
 
-  keyboardHook_ = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, hInstance, 0);
-  if (!keyboardHook_) {
-    std::cerr << "[WindowFocus] Failed to install keyboard hook: " << GetLastError() << std::endl;
-  } else {
-    if (instance_ && instance_->enableDebug_) {
-      std::cout << "[WindowFocus] Keyboard hook installed successfully\n";
-    }
-  }
-
   mouseHook_ = SetWindowsHookEx(WH_MOUSE_LL, MouseProc, hInstance, 0);
   if (!mouseHook_) {
     std::cerr << "[WindowFocus] Failed to install mouse hook: " << GetLastError() << std::endl;
@@ -111,10 +81,6 @@ void WindowFocusPlugin::SetHooks() {
 }
 
 void WindowFocusPlugin::RemoveHooks() {
-  if (keyboardHook_) {
-    UnhookWindowsHookEx(keyboardHook_);
-    keyboardHook_ = nullptr;
-  }
   if (mouseHook_) {
     UnhookWindowsHookEx(mouseHook_);
     mouseHook_ = nullptr;
