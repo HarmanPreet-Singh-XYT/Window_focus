@@ -13,7 +13,7 @@
 #include <flutter/encodable_value.h>
 #include <Windows.h>
 #include <xinput.h>
-
+#include <algorithm> 
 #include <iostream>
 #include <memory>
 #include <string>
