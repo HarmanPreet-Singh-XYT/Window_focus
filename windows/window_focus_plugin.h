@@ -3,92 +3,97 @@
 
 #include <flutter/method_channel.h>
 #include <flutter/plugin_registrar_windows.h>
-#include <chrono>
+
 #include <memory>
+#include <chrono>
 #include <vector>
-#include <windows.h>
+#include <mutex>
+#include <atomic>
+#include <Windows.h>
 #include <xinput.h>
 #include <mmdeviceapi.h>
-#include <audioclient.h>
 #include <endpointvolume.h>
+#include <audioclient.h>
 #include <hidsdi.h>
-
-#pragma comment(lib, "XInput.lib")
-#pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "hid.lib")
-#pragma comment(lib, "setupapi.lib")
 
 namespace window_focus {
 
 class WindowFocusPlugin : public flutter::Plugin {
  public:
-  // Method for registering the plugin
-  static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar);
+  static void RegisterWithRegistrar(flutter::PluginRegistrarWindows *registrar);
 
-  // Constructor / Destructor
   WindowFocusPlugin();
+
   virtual ~WindowFocusPlugin();
 
+  // Disallow copy and assign.
+  WindowFocusPlugin(const WindowFocusPlugin&) = delete;
+  WindowFocusPlugin& operator=(const WindowFocusPlugin&) = delete;
+
+  // Called when a method is called on this plugin's channel from Dart.
   void HandleMethodCall(
-      const flutter::MethodCall<flutter::EncodableValue>& method_call,
+      const flutter::MethodCall<flutter::EncodableValue> &method_call,
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 
- private:
-  // == 1) Singleton-like instance pointer
-  static WindowFocusPlugin* instance_;
-
-  // == 2) Static hooks and hook variables
-  static HHOOK keyboardHook_;
-  static HHOOK mouseHook_;
+  void CheckForInactivity();
+  void StartFocusListener();
+  void MonitorAllInputDevices();
+  void UpdateLastActivityTime();
   
+  static void SetHooks();
+  static void RemoveHooks();
+  
+  std::optional<std::vector<uint8_t>> TakeScreenshot(bool activeWindowOnly);
+
+  // Hook procedures
   static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
   static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam);
 
-  // == 3) Regular (non-static) fields
-  std::shared_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel;
-  
-  bool userIsActive_ = true;
-  int inactivityThreshold_ = 1000;
-  bool enableDebug_ = false;
-  
-  std::chrono::steady_clock::time_point lastActivityTime;
-  
-  // Controller/gamepad detection
-  bool monitorControllers_ = true;
-  XINPUT_STATE lastControllerStates_[XUSER_MAX_COUNT];
-  POINT lastMousePosition_;
-  
-  // Audio detection
-  bool monitorAudio_ = true;
-  float audioThreshold_ = 0.001f; // Minimum audio level to consider as activity
-  
-  // HID device detection
-  bool monitorHIDDevices_ = true;
-  std::vector<HANDLE> hidDeviceHandles_;
-  std::vector<std::vector<BYTE>> lastHIDStates_; // Store last state for each device
-
-  // == 4) Internal methods
-  void SetHooks();
-  void RemoveHooks();
-  void UpdateLastActivityTime();
-  
-  void CheckForInactivity();
-  void StartFocusListener();
-  
-  // Input monitoring
-  void MonitorAllInputDevices();
+  // Input monitoring methods
   bool CheckControllerInput();
   bool CheckRawInput();
-  
-  // NEW: Audio detection
   bool CheckSystemAudio();
-  
-  // NEW: HID device detection
-  void InitializeHIDDevices();
   bool CheckHIDDevices();
+  void InitializeHIDDevices();
   void CloseHIDDevices();
-  
-  std::optional<std::vector<uint8_t>> TakeScreenshot(bool activeWindowOnly);
+
+  std::shared_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel;
+
+ private:
+  static WindowFocusPlugin* instance_;
+  static HHOOK keyboardHook_;
+  static HHOOK mouseHook_;
+
+  // Thread safety
+  std::mutex activityMutex_;
+  std::mutex channelMutex_;
+  std::mutex hidDevicesMutex_;
+  std::mutex mouseMutex_;
+  std::atomic<bool> isShuttingDown_;
+
+  // Activity tracking
+  std::chrono::steady_clock::time_point lastActivityTime;
+  bool userIsActive_ = true;
+  int inactivityThreshold_ = 60000; // Default 60 seconds
+
+  // Debug mode
+  bool enableDebug_ = false;
+
+  // Controller monitoring
+  bool monitorControllers_ = true;
+  XINPUT_STATE lastControllerStates_[XUSER_MAX_COUNT];
+
+  // Mouse monitoring
+  POINT lastMousePosition_;
+
+  // Audio monitoring
+  bool monitorAudio_ = false;
+  float audioThreshold_ = 0.01f; // 1% peak threshold
+
+  // HID device monitoring
+  bool monitorHIDDevices_ = false;
+  std::vector<HANDLE> hidDeviceHandles_;
+  std::vector<std::vector<BYTE>> lastHIDStates_;
 };
 
 }  // namespace window_focus
