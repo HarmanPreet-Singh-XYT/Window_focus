@@ -42,6 +42,7 @@ namespace window_focus {
 
 WindowFocusPlugin* WindowFocusPlugin::instance_ = nullptr;
 HHOOK WindowFocusPlugin::mouseHook_ = nullptr;
+HHOOK WindowFocusPlugin::keyboardHook_ = nullptr;
 
 using CallbackMethod = std::function<void(const std::wstring&)>;
 
@@ -64,18 +65,52 @@ LRESULT CALLBACK WindowFocusPlugin::MouseProc(int nCode, WPARAM wParam, LPARAM l
   return CallNextHookEx(mouseHook_, nCode, wParam, lParam);
 }
 
+LRESULT CALLBACK WindowFocusPlugin::KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+  if (nCode == HC_ACTION && instance_) {
+    if (instance_->enableDebug_) {
+      std::cout << "[WindowFocus] keyboard hook detected action" << std::endl;
+    }
+    instance_->UpdateLastActivityTime();
+    if (!instance_->userIsActive_) {
+      instance_->userIsActive_ = true;
+      if (instance_->channel) {
+        std::lock_guard<std::mutex> lock(instance_->channelMutex_);
+        instance_->channel->InvokeMethod(
+          "onUserActive",
+          std::make_unique<flutter::EncodableValue>("User is active"));
+      }
+    }
+  }
+  return CallNextHookEx(keyboardHook_, nCode, wParam, lParam);
+}
+
 void WindowFocusPlugin::SetHooks() {
   if (instance_ && instance_->enableDebug_) {
     std::cout << "[WindowFocus] SetHooks: start\n";
   }
   HINSTANCE hInstance = GetModuleHandle(nullptr);
 
-  mouseHook_ = SetWindowsHookEx(WH_MOUSE_LL, MouseProc, hInstance, 0);
-  if (!mouseHook_) {
-    std::cerr << "[WindowFocus] Failed to install mouse hook: " << GetLastError() << std::endl;
-  } else {
-    if (instance_ && instance_->enableDebug_) {
-      std::cout << "[WindowFocus] Mouse hook installed successfully\n";
+  // Install mouse hook if monitoring is enabled
+  if (monitorMouse_) {
+    mouseHook_ = SetWindowsHookEx(WH_MOUSE_LL, MouseProc, hInstance, 0);
+    if (!mouseHook_) {
+      std::cerr << "[WindowFocus] Failed to install mouse hook: " << GetLastError() << std::endl;
+    } else {
+      if (instance_ && instance_->enableDebug_) {
+        std::cout << "[WindowFocus] Mouse hook installed successfully\n";
+      }
+    }
+  }
+
+  // Install keyboard hook if monitoring is enabled
+  if (monitorKeyboard_) {
+    keyboardHook_ = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, hInstance, 0);
+    if (!keyboardHook_) {
+      std::cerr << "[WindowFocus] Failed to install keyboard hook: " << GetLastError() << std::endl;
+    } else {
+      if (instance_ && instance_->enableDebug_) {
+        std::cout << "[WindowFocus] Keyboard hook installed successfully\n";
+      }
     }
   }
 }
@@ -84,6 +119,10 @@ void WindowFocusPlugin::RemoveHooks() {
   if (mouseHook_) {
     UnhookWindowsHookEx(mouseHook_);
     mouseHook_ = nullptr;
+  }
+  if (keyboardHook_) {
+    UnhookWindowsHookEx(keyboardHook_);
+    keyboardHook_ = nullptr;
   }
 }
 
@@ -205,6 +244,50 @@ void WindowFocusPlugin::HandleMethodCall(
         }
       }
       result->Error("Invalid argument", "Expected a bool for 'debug'.");
+      return;
+  }
+
+  if (method_name == "setKeyboardMonitoring") {
+      if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
+        auto it = args->find(flutter::EncodableValue("enabled"));
+        if (it != args->end()) {
+          if (std::holds_alternative<bool>(it->second)) {
+            bool newValue = std::get<bool>(it->second);
+            if (newValue != monitorKeyboard_) {
+              monitorKeyboard_ = newValue;
+              // Re-install hooks with new settings
+              RemoveHooks();
+              SetHooks();
+              std::cout << "[WindowFocus] Keyboard monitoring set to " << (monitorKeyboard_ ? "true" : "false") << std::endl;
+            }
+            result->Success();
+            return;
+          }
+        }
+      }
+      result->Error("Invalid argument", "Expected a bool for 'enabled'.");
+      return;
+  }
+
+  if (method_name == "setMouseMonitoring") {
+      if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
+        auto it = args->find(flutter::EncodableValue("enabled"));
+        if (it != args->end()) {
+          if (std::holds_alternative<bool>(it->second)) {
+            bool newValue = std::get<bool>(it->second);
+            if (newValue != monitorMouse_) {
+              monitorMouse_ = newValue;
+              // Re-install hooks with new settings
+              RemoveHooks();
+              SetHooks();
+              std::cout << "[WindowFocus] Mouse monitoring set to " << (monitorMouse_ ? "true" : "false") << std::endl;
+            }
+            result->Success();
+            return;
+          }
+        }
+      }
+      result->Error("Invalid argument", "Expected a bool for 'enabled'.");
       return;
   }
 
@@ -385,6 +468,10 @@ bool WindowFocusPlugin::CheckControllerInput() {
 }
 
 bool WindowFocusPlugin::CheckRawInput() {
+    if (!monitorMouse_) {
+        return false;
+    }
+
     POINT currentMousePos;
     if (GetCursorPos(&currentMousePos)) {
         std::lock_guard<std::mutex> lock(mouseMutex_);
@@ -780,6 +867,7 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
             if (isShuttingDown_) break;
 
             // Check raw input (mouse movement via cursor position)
+            // Note: Mouse clicks are handled by the mouse hook
             if (CheckRawInput()) {
                 inputDetected = true;
             }
