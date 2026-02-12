@@ -9,8 +9,6 @@ class WindowFocus {
   WindowFocus({
     bool debug = false,
     Duration duration = const Duration(seconds: 1),
-    bool monitorKeyboard = true,
-    bool monitorMouse = true,
     bool monitorAudio = true,
     bool monitorControllers = true,
     bool monitorHIDDevices = true,
@@ -23,8 +21,6 @@ class WindowFocus {
     _initializePlugin(
       debug: debug,
       duration: duration,
-      monitorKeyboard: monitorKeyboard,
-      monitorMouse: monitorMouse,
       monitorAudio: monitorAudio,
       monitorControllers: monitorControllers,
       monitorHIDDevices: monitorHIDDevices,
@@ -49,8 +45,6 @@ class WindowFocus {
   Future<void> _initializePlugin({
     required bool debug,
     required Duration duration,
-    required bool monitorKeyboard,
-    required bool monitorMouse,
     required bool monitorAudio,
     required bool monitorControllers,
     required bool monitorHIDDevices,
@@ -61,8 +55,6 @@ class WindowFocus {
         await setDebug(debug);
       }
       await setIdleThreshold(duration: duration);
-      await setKeyboardMonitoring(monitorKeyboard);
-      await setMouseMonitoring(monitorMouse);
       await setAudioMonitoring(monitorAudio);
       await setControllerMonitoring(monitorControllers);
       await setHIDMonitoring(monitorHIDDevices);
@@ -550,70 +542,6 @@ class WindowFocus {
         WindowFocusError(
           type: WindowFocusErrorType.configuration,
           message: 'Unexpected error setting debug mode: $e',
-          originalError: e,
-          stackTrace: stackTrace,
-        ),
-      );
-    }
-  }
-
-  /// Enables or disables keyboard input monitoring.
-  ///
-  /// When enabled, keyboard input from any application (including when your app
-  /// is not in focus) will be detected as user activity.
-  ///
-  /// Default: true
-  Future<void> setKeyboardMonitoring(bool enabled) async {
-    try {
-      await _channel.invokeMethod('setKeyboardMonitoring', {
-        'enabled': enabled,
-      });
-    } on PlatformException catch (e, stackTrace) {
-      _handleError(
-        WindowFocusError(
-          type: WindowFocusErrorType.configuration,
-          message: 'Failed to set keyboard monitoring: ${e.message}',
-          originalError: e,
-          stackTrace: stackTrace,
-        ),
-      );
-    } catch (e, stackTrace) {
-      _handleError(
-        WindowFocusError(
-          type: WindowFocusErrorType.configuration,
-          message: 'Unexpected error setting keyboard monitoring: $e',
-          originalError: e,
-          stackTrace: stackTrace,
-        ),
-      );
-    }
-  }
-
-  /// Enables or disables mouse input monitoring.
-  ///
-  /// When enabled, mouse movements and clicks from any application (including when
-  /// your app is not in focus) will be detected as user activity.
-  ///
-  /// Default: true
-  Future<void> setMouseMonitoring(bool enabled) async {
-    try {
-      await _channel.invokeMethod('setMouseMonitoring', {
-        'enabled': enabled,
-      });
-    } on PlatformException catch (e, stackTrace) {
-      _handleError(
-        WindowFocusError(
-          type: WindowFocusErrorType.configuration,
-          message: 'Failed to set mouse monitoring: ${e.message}',
-          originalError: e,
-          stackTrace: stackTrace,
-        ),
-      );
-    } catch (e, stackTrace) {
-      _handleError(
-        WindowFocusError(
-          type: WindowFocusErrorType.configuration,
-          message: 'Unexpected error setting mouse monitoring: $e',
           originalError: e,
           stackTrace: stackTrace,
         ),
