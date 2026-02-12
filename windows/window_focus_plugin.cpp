@@ -42,7 +42,7 @@
 
 namespace window_focus {
 
-WindowFocusPlugin* WindowFocusPlugin::instance_ = nullptr;
+std::atomic<WindowFocusPlugin*> WindowFocusPlugin::instance_{nullptr};
 HHOOK WindowFocusPlugin::mouseHook_ = nullptr;
 HHOOK WindowFocusPlugin::keyboardHook_ = nullptr;
 
@@ -52,7 +52,6 @@ using CallbackMethod = std::function<void(const std::wstring&)>;
 // RAII Helpers
 // =====================================================================
 
-// RAII wrapper for COM initialization/uninitalization per thread
 class ComInitializer {
 public:
     ComInitializer() : initialized_(false), needsUninitialize_(false) {
@@ -82,7 +81,6 @@ private:
     bool needsUninitialize_;
 };
 
-// RAII wrapper for GDI+ startup/shutdown
 class GdiplusInitializer {
 public:
     GdiplusInitializer() : token_(0), initialized_(false) {
@@ -107,7 +105,6 @@ private:
     bool initialized_;
 };
 
-// RAII wrapper for HDC obtained via GetDC
 class DcHandle {
 public:
     DcHandle(HWND hwnd) : hwnd_(hwnd), hdc_(nullptr) {
@@ -129,7 +126,6 @@ private:
     HDC hdc_;
 };
 
-// RAII wrapper for CreateCompatibleDC
 class CompatibleDc {
 public:
     CompatibleDc(HDC hdc) : hdc_(nullptr) {
@@ -150,7 +146,6 @@ private:
     HDC hdc_;
 };
 
-// RAII wrapper for HBITMAP
 class BitmapHandle {
 public:
     BitmapHandle(HBITMAP bmp) : bmp_(bmp) {}
@@ -169,7 +164,6 @@ private:
     HBITMAP bmp_;
 };
 
-// RAII wrapper for SelectObject (restores old object on destruction)
 class SelectedObject {
 public:
     SelectedObject(HDC hdc, HGDIOBJ obj) : hdc_(hdc), old_(nullptr) {
@@ -192,9 +186,7 @@ private:
 };
 
 // =====================================================================
-// SEH-isolated helper functions (no C++ objects with destructors allowed)
-// These functions MUST NOT use std::vector, std::string, std::lock_guard,
-// or any other C++ objects that require stack unwinding.
+// SEH-isolated helper functions
 // =====================================================================
 
 static bool ReadHIDDeviceSEH(HANDLE deviceHandle, BYTE* buffer, DWORD bufferSize,
@@ -369,7 +361,6 @@ static bool IsHandleValid(HANDLE handle) {
     }
 }
 
-// SEH-protected keyboard state check via GetAsyncKeyState
 static bool CheckKeyStateSEH(int vKey, bool* exceptionOccurred) {
     *exceptionOccurred = false;
     __try {
@@ -386,71 +377,76 @@ static bool CheckKeyStateSEH(int vKey, bool* exceptionOccurred) {
 // End of SEH-isolated helpers
 // =====================================================================
 
-// Keyboard hook callback
+// Keyboard hook callback - uses atomic instance_ for thread safety
 LRESULT CALLBACK WindowFocusPlugin::KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode == HC_ACTION && instance_ && !instance_->isShuttingDown_) {
-        if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-            if (instance_->enableDebug_) {
-                KBDLLHOOKSTRUCT* pKeyboard = (KBDLLHOOKSTRUCT*)lParam;
-                if (pKeyboard) {
-                    std::cout << "[WindowFocus] Keyboard hook: key down vkCode="
-                              << pKeyboard->vkCode << std::endl;
+    if (nCode == HC_ACTION) {
+        WindowFocusPlugin* inst = instance_.load(std::memory_order_acquire);
+        if (inst && !inst->isShuttingDown_) {
+            if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+                if (inst->enableDebug_) {
+                    KBDLLHOOKSTRUCT* pKeyboard = (KBDLLHOOKSTRUCT*)lParam;
+                    if (pKeyboard) {
+                        std::cout << "[WindowFocus] Keyboard hook: key down vkCode="
+                                  << pKeyboard->vkCode << std::endl;
+                    }
                 }
-            }
 
-            instance_->UpdateLastActivityTime();
+                inst->UpdateLastActivityTime();
 
-            auto now = std::chrono::steady_clock::now();
-            auto epoch = now.time_since_epoch();
-            instance_->lastKeyEventTime_ = std::chrono::duration_cast<std::chrono::milliseconds>(epoch).count();
+                auto now = std::chrono::steady_clock::now();
+                auto epoch = now.time_since_epoch();
+                inst->lastKeyEventTime_ = std::chrono::duration_cast<std::chrono::milliseconds>(epoch).count();
 
-            if (!instance_->userIsActive_) {
-                instance_->userIsActive_ = true;
-                instance_->SafeInvokeMethod("onUserActive", "User is active");
+                if (!inst->userIsActive_) {
+                    inst->userIsActive_ = true;
+                    inst->SafeInvokeMethod("onUserActive", "User is active");
+                }
             }
         }
     }
     return CallNextHookEx(keyboardHook_, nCode, wParam, lParam);
 }
 
+// Mouse hook callback - uses atomic instance_ for thread safety
 LRESULT CALLBACK WindowFocusPlugin::MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode == HC_ACTION && instance_ && !instance_->isShuttingDown_) {
-        if (instance_->enableDebug_) {
-            std::cout << "[WindowFocus] mouse hook detected action" << std::endl;
-        }
-        instance_->UpdateLastActivityTime();
-        if (!instance_->userIsActive_) {
-            instance_->userIsActive_ = true;
-            instance_->SafeInvokeMethod("onUserActive", "User is active");
+    if (nCode == HC_ACTION) {
+        WindowFocusPlugin* inst = instance_.load(std::memory_order_acquire);
+        if (inst && !inst->isShuttingDown_) {
+            if (inst->enableDebug_) {
+                std::cout << "[WindowFocus] mouse hook detected action" << std::endl;
+            }
+            inst->UpdateLastActivityTime();
+            if (!inst->userIsActive_) {
+                inst->userIsActive_ = true;
+                inst->SafeInvokeMethod("onUserActive", "User is active");
+            }
         }
     }
     return CallNextHookEx(mouseHook_, nCode, wParam, lParam);
 }
 
-bool WindowFocusPlugin::SetHooks() {
-    if (instance_ && instance_->enableDebug_) {
+void WindowFocusPlugin::SetHooks() {
+    WindowFocusPlugin* inst = instance_.load(std::memory_order_acquire);
+    if (inst && inst->enableDebug_) {
         std::cout << "[WindowFocus] SetHooks: start\n";
     }
     HINSTANCE hInstance = GetModuleHandle(nullptr);
-    bool allSucceeded = true;
 
     // Install mouse hook with retry
     mouseHook_ = SetWindowsHookEx(WH_MOUSE_LL, MouseProc, hInstance, 0);
     if (!mouseHook_) {
         DWORD error = GetLastError();
         std::cerr << "[WindowFocus] Failed to install mouse hook: " << error << std::endl;
-        allSucceeded = false;
 
         Sleep(100);
         mouseHook_ = SetWindowsHookEx(WH_MOUSE_LL, MouseProc, hInstance, 0);
         if (mouseHook_) {
             std::cout << "[WindowFocus] Mouse hook installed on retry" << std::endl;
-            allSucceeded = true;
         } else {
             std::cerr << "[WindowFocus] Mouse hook retry also failed: " << GetLastError() << std::endl;
         }
     } else {
-        if (instance_ && instance_->enableDebug_) {
+        if (inst && inst->enableDebug_) {
             std::cout << "[WindowFocus] Mouse hook installed successfully\n";
         }
     }
@@ -460,7 +456,6 @@ bool WindowFocusPlugin::SetHooks() {
     if (!keyboardHook_) {
         DWORD error = GetLastError();
         std::cerr << "[WindowFocus] Failed to install keyboard hook: " << error << std::endl;
-        allSucceeded = false;
 
         Sleep(100);
         keyboardHook_ = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, hInstance, 0);
@@ -471,12 +466,10 @@ bool WindowFocusPlugin::SetHooks() {
             SafeInvokeMethod("onError", "Keyboard hook installation failed - using polling fallback");
         }
     } else {
-        if (instance_ && instance_->enableDebug_) {
+        if (inst && inst->enableDebug_) {
             std::cout << "[WindowFocus] Keyboard hook installed successfully\n";
         }
     }
-
-    return allSucceeded;
 }
 
 void WindowFocusPlugin::RemoveHooks() {
@@ -507,12 +500,13 @@ void WindowFocusPlugin::SafeInvokeMethod(const std::string& methodName, const st
         }
     } catch (const std::exception& e) {
         if (enableDebug_) {
-            std::cerr << "[WindowFocus] Exception invoking method '" << methodName
-                      << "': " << e.what() << std::endl;
+            std::cerr << "[WindowFocus] Exception invoking method '"
+                      << methodName << "': " << e.what() << std::endl;
         }
     } catch (...) {
         if (enableDebug_) {
-            std::cerr << "[WindowFocus] Unknown exception invoking method: " << methodName << std::endl;
+            std::cerr << "[WindowFocus] Unknown exception invoking method: "
+                      << methodName << std::endl;
         }
     }
 }
@@ -534,7 +528,8 @@ void WindowFocusPlugin::SafeInvokeMethodWithMap(const std::string& methodName, f
         }
     } catch (...) {
         if (enableDebug_) {
-            std::cerr << "[WindowFocus] Unknown exception invoking method with map: " << methodName << std::endl;
+            std::cerr << "[WindowFocus] Unknown exception invoking method with map: "
+                      << methodName << std::endl;
         }
     }
 }
@@ -616,8 +611,9 @@ std::string GetFocusedWindowTitle() {
     return windowTitle;
 }
 
-WindowFocusPlugin::WindowFocusPlugin() : isShuttingDown_(false), threadCount_(0) {
-    if (instance_ != nullptr) {
+WindowFocusPlugin::WindowFocusPlugin() : isShuttingDown_(false) {
+    WindowFocusPlugin* expected = nullptr;
+    if (!instance_.compare_exchange_strong(expected, this, std::memory_order_release)) {
         std::cerr << "[WindowFocus] WARNING: Multiple plugin instances created. "
                   << "Previous instance will be orphaned." << std::endl;
         if (mouseHook_) {
@@ -628,8 +624,8 @@ WindowFocusPlugin::WindowFocusPlugin() : isShuttingDown_(false), threadCount_(0)
             UnhookWindowsHookEx(keyboardHook_);
             keyboardHook_ = nullptr;
         }
+        instance_.store(this, std::memory_order_release);
     }
-    instance_ = this;
 
     lastActivityTime = std::chrono::steady_clock::now();
     ZeroMemory(lastControllerStates_, sizeof(lastControllerStates_));
@@ -637,37 +633,41 @@ WindowFocusPlugin::WindowFocusPlugin() : isShuttingDown_(false), threadCount_(0)
 }
 
 WindowFocusPlugin::~WindowFocusPlugin() {
+    // 1. Set shutdown flag first
     isShuttingDown_ = true;
 
-    // Signal all threads to stop
+    // 2. Remove hooks BEFORE joining threads or nullifying instance
+    //    This stops hook callbacks from firing
+    RemoveHooks();
+
+    // 3. Signal all threads to wake up and exit
     {
         std::lock_guard<std::mutex> lock(shutdownMutex_);
         shutdownCv_.notify_all();
     }
 
-    // Wait for threads with timeout
-    auto waitStart = std::chrono::steady_clock::now();
-    while (threadCount_ > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        auto elapsed = std::chrono::steady_clock::now() - waitStart;
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() > 3000) {
-            if (enableDebug_) {
-                std::cerr << "[WindowFocus] Timeout waiting for threads. Remaining: "
-                          << threadCount_.load() << std::endl;
+    // 4. Join all threads - guaranteed no use-after-free
+    {
+        std::lock_guard<std::mutex> lock(threadsMutex_);
+        for (auto& t : threads_) {
+            if (t.joinable()) {
+                t.join();
             }
-            break;
         }
+        threads_.clear();
     }
 
+    // 5. Close HID devices
     CloseHIDDevices();
-    RemoveHooks();
 
+    // 6. Nullify channel under lock
     {
         std::lock_guard<std::mutex> lock(channelMutex_);
         channel = nullptr;
     }
 
-    instance_ = nullptr;
+    // 7. Nullify instance last
+    instance_.store(nullptr, std::memory_order_release);
 }
 
 void WindowFocusPlugin::HandleMethodCall(
@@ -830,7 +830,8 @@ void WindowFocusPlugin::HandleMethodCall(
                 result->Error("SCREENSHOT_ERROR", "Failed to take screenshot");
             }
         } catch (const std::exception& e) {
-            result->Error("SCREENSHOT_ERROR", std::string("Exception taking screenshot: ") + e.what());
+            result->Error("SCREENSHOT_ERROR",
+                         std::string("Exception taking screenshot: ") + e.what());
         } catch (...) {
             result->Error("SCREENSHOT_ERROR", "Unknown exception taking screenshot");
         }
@@ -942,7 +943,6 @@ bool WindowFocusPlugin::CheckKeyboardInput() {
         return false;
     }
 
-    // Method 1: Check if the keyboard hook has recently detected input
     auto now = std::chrono::steady_clock::now();
     auto epoch = now.time_since_epoch();
     uint64_t currentTime = std::chrono::duration_cast<std::chrono::milliseconds>(epoch).count();
@@ -952,10 +952,9 @@ bool WindowFocusPlugin::CheckKeyboardInput() {
         return true;
     }
 
-    // Method 2: Poll common keys using GetAsyncKeyState as fallback
     bool exceptionOccurred = false;
 
-    for (int vk = 0x41; vk <= 0x5A; vk++) { // A-Z
+    for (int vk = 0x41; vk <= 0x5A; vk++) {
         if (isShuttingDown_) return false;
         if (CheckKeyStateSEH(vk, &exceptionOccurred)) {
             if (!exceptionOccurred) {
@@ -969,7 +968,7 @@ bool WindowFocusPlugin::CheckKeyboardInput() {
         if (exceptionOccurred) break;
     }
 
-    for (int vk = 0x30; vk <= 0x39; vk++) { // 0-9
+    for (int vk = 0x30; vk <= 0x39; vk++) {
         if (isShuttingDown_) return false;
         if (CheckKeyStateSEH(vk, &exceptionOccurred)) {
             if (!exceptionOccurred) {
@@ -1118,7 +1117,7 @@ void WindowFocusPlugin::InitializeHIDDevices() {
             (PSP_DEVICE_INTERFACE_DETAIL_DATA)malloc(requiredSize);
         if (!detailData) {
             if (enableDebug_) {
-                std::cerr << "[WindowFocus] Failed to allocate memory for HID device detail data" << std::endl;
+                std::cerr << "[WindowFocus] Failed to allocate memory for HID device detail" << std::endl;
             }
             continue;
         }
@@ -1271,7 +1270,8 @@ bool WindowFocusPlugin::CheckHIDDevices() {
                         lastState = buffer;
 
                         if (enableDebug_) {
-                            std::cout << "[WindowFocus] HID device " << i << " input detected (overlapped)" << std::endl;
+                            std::cout << "[WindowFocus] HID device " << i
+                                      << " input detected (overlapped)" << std::endl;
                         }
                     }
                 } else if (overlappedError == ERROR_INVALID_HANDLE ||
@@ -1283,7 +1283,8 @@ bool WindowFocusPlugin::CheckHIDDevices() {
             } else if (waitResult == WAIT_FAILED) {
                 DWORD waitError = GetLastError();
                 if (enableDebug_) {
-                    std::cout << "[WindowFocus] HID device " << i << " wait failed: " << waitError << std::endl;
+                    std::cout << "[WindowFocus] HID device " << i
+                              << " wait failed: " << waitError << std::endl;
                 }
                 if (waitError == ERROR_INVALID_HANDLE) {
                     invalidDevices.push_back(i);
@@ -1313,7 +1314,6 @@ bool WindowFocusPlugin::CheckHIDDevices() {
         }
     }
 
-    // Remove invalid devices (reverse order to preserve indices)
     if (!invalidDevices.empty()) {
         std::sort(invalidDevices.begin(), invalidDevices.end());
         invalidDevices.erase(std::unique(invalidDevices.begin(), invalidDevices.end()), invalidDevices.end());
@@ -1361,8 +1361,8 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
         InitializeHIDDevices();
     }
 
-    threadCount_++;
-    std::thread([this]() {
+    std::lock_guard<std::mutex> lock(threadsMutex_);
+    threads_.emplace_back([this]() {
         auto lastHIDReinit = std::chrono::steady_clock::now();
         const auto hidReinitInterval = std::chrono::seconds(30);
 
@@ -1406,7 +1406,6 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
                 }
             }
 
-            // Periodically re-initialize HID devices if all disconnected
             if (monitorHIDDevices_ && !isShuttingDown_) {
                 auto now = std::chrono::steady_clock::now();
                 if (now - lastHIDReinit > hidReinitInterval) {
@@ -1434,14 +1433,12 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
                 }
             }
         }
-
-        threadCount_--;
-    }).detach();
+    });
 }
 
 void WindowFocusPlugin::CheckForInactivity() {
-    threadCount_++;
-    std::thread([this]() {
+    std::lock_guard<std::mutex> lock(threadsMutex_);
+    threads_.emplace_back([this]() {
         while (!isShuttingDown_) {
             {
                 std::unique_lock<std::mutex> lock(shutdownMutex_);
@@ -1458,7 +1455,8 @@ void WindowFocusPlugin::CheckForInactivity() {
 
             {
                 std::lock_guard<std::mutex> lock(activityMutex_);
-                duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastActivityTime).count();
+                duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - lastActivityTime).count();
             }
 
             if (duration > inactivityThreshold_ && userIsActive_) {
@@ -1470,14 +1468,12 @@ void WindowFocusPlugin::CheckForInactivity() {
                 SafeInvokeMethod("onUserInactivity", "User is inactive");
             }
         }
-
-        threadCount_--;
-    }).detach();
+    });
 }
 
 void WindowFocusPlugin::StartFocusListener() {
-    threadCount_++;
-    std::thread([this]() {
+    std::lock_guard<std::mutex> lock(threadsMutex_);
+    threads_.emplace_back([this]() {
         HWND last_focused = nullptr;
         while (!isShuttingDown_) {
             try {
@@ -1528,9 +1524,7 @@ void WindowFocusPlugin::StartFocusListener() {
                 }
             }
         }
-
-        threadCount_--;
-    }).detach();
+    });
 }
 
 int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
@@ -1616,7 +1610,8 @@ std::optional<std::vector<uint8_t>> WindowFocusPlugin::TakeScreenshot(bool activ
     // RAII select object (auto-restores old bitmap)
     SelectedObject selectedBitmap(hdcMemDC.Get(), hbmScreen.Get());
 
-    if (!BitBlt(hdcMemDC.Get(), 0, 0, width, height, hdcScreen.Get(), rc.left, rc.top, SRCCOPY)) {
+    if (!BitBlt(hdcMemDC.Get(), 0, 0, width, height,
+                hdcScreen.Get(), rc.left, rc.top, SRCCOPY)) {
         if (enableDebug_) {
             std::cerr << "[WindowFocus] BitBlt failed: " << GetLastError() << std::endl;
         }
@@ -1627,9 +1622,11 @@ std::optional<std::vector<uint8_t>> WindowFocusPlugin::TakeScreenshot(bool activ
     Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(hbmScreen.Get(), NULL);
     if (!bitmap || bitmap->GetLastStatus() != Gdiplus::Ok) {
         if (enableDebug_) {
-            std::cerr << "[WindowFocus] Bitmap creation failed"
-                      << (bitmap ? (": status=" + std::to_string(bitmap->GetLastStatus())) : "")
-                      << std::endl;
+            std::cerr << "[WindowFocus] Bitmap creation failed";
+            if (bitmap) {
+                std::cerr << ": status=" << bitmap->GetLastStatus();
+            }
+            std::cerr << std::endl;
         }
         if (bitmap) delete bitmap;
         return std::nullopt;
