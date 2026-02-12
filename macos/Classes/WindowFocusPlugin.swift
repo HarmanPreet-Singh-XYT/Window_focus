@@ -829,7 +829,7 @@ public class IdleTracker: NSObject {
     }
 
     private func handleHIDDeviceRemoved(_ device: IOHIDDevice) {
-        if let index = hidDevices.firstIndex(where: { \$0 == device }) {
+        if let index = hidDevices.firstIndex(where: { $0 === device }) {
             hidDevices.remove(at: index)
             lastHIDStates.removeValue(forKey: device)
             

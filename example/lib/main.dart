@@ -72,13 +72,13 @@ class _MyAppState extends State<MyApp> {
 
     // Initialize with all monitoring features enabled
     _windowFocusPlugin = WindowFocus(
-      debug: _debugMode,
-      duration: const Duration(seconds: 10),
-      monitorAudio: _monitorAudio,
-      monitorControllers: _monitorControllers,
-      monitorHIDDevices: _monitorHIDDevices,
-      audioThreshold: _audioThreshold,
-    );
+        debug: _debugMode,
+        duration: const Duration(seconds: 10),
+        monitorAudio: _monitorAudio,
+        monitorControllers: _monitorControllers,
+        monitorHIDDevices: _monitorHIDDevices,
+        audioThreshold: _audioThreshold,
+        monitorKeyboard: true);
 
     _windowFocusPlugin.addFocusChangeListener((p0) {
       _handleFocusChange(p0);
