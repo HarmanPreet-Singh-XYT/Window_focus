@@ -40,7 +40,9 @@ class WindowFocusPlugin : public flutter::Plugin {
   // Static members for hooks
   static WindowFocusPlugin* instance_;
   static HHOOK mouseHook_;
+  static HHOOK keyboardHook_;
   static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam);
+  static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
 
   // Debug flag
   std::atomic<bool> enableDebug_{false};
@@ -66,6 +68,10 @@ class WindowFocusPlugin : public flutter::Plugin {
   std::vector<HANDLE> hidDeviceHandles_;
   std::vector<std::vector<BYTE>> lastHIDStates_;
   std::mutex hidDevicesMutex_;
+
+  // Keyboard monitoring
+  std::atomic<bool> monitorKeyboard_{true};
+  std::atomic<uint64_t> lastKeyEventTime_{0};
 
   // Mouse tracking
   POINT lastMousePosition_;
@@ -99,6 +105,7 @@ class WindowFocusPlugin : public flutter::Plugin {
   bool CheckControllerInput();
   bool CheckRawInput();
   bool CheckSystemAudio();
+  bool CheckKeyboardInput();
   void InitializeHIDDevices();
   bool CheckHIDDevices();
   void CloseHIDDevices();

@@ -12,6 +12,7 @@ class WindowFocus {
     bool monitorAudio = true,
     bool monitorControllers = true,
     bool monitorHIDDevices = true,
+    bool monitorKeyboard = true,
     double audioThreshold = 0.001,
   }) {
     _debug = debug;
@@ -24,6 +25,7 @@ class WindowFocus {
       monitorAudio: monitorAudio,
       monitorControllers: monitorControllers,
       monitorHIDDevices: monitorHIDDevices,
+      monitorKeyboard: monitorKeyboard,
       audioThreshold: audioThreshold,
     );
   }
@@ -48,6 +50,7 @@ class WindowFocus {
     required bool monitorAudio,
     required bool monitorControllers,
     required bool monitorHIDDevices,
+    required bool monitorKeyboard,
     required double audioThreshold,
   }) async {
     try {
@@ -58,6 +61,7 @@ class WindowFocus {
       await setAudioMonitoring(monitorAudio);
       await setControllerMonitoring(monitorControllers);
       await setHIDMonitoring(monitorHIDDevices);
+      await setKeyboardMonitoring(monitorKeyboard);
       await setAudioThreshold(audioThreshold);
       _isInitialized = true;
 
@@ -312,7 +316,7 @@ class WindowFocus {
   }
 
   // ============================================================
-  // INPUT MONITORING PERMISSION (NEW)
+  // INPUT MONITORING PERMISSION
   // ============================================================
 
   /// Checks if the application has Input Monitoring permission.
@@ -550,6 +554,9 @@ class WindowFocus {
   }
 
   /// Enables or disables controller/gamepad input monitoring.
+  ///
+  /// When enabled, the plugin monitors XInput-compatible controllers
+  /// (Xbox controllers, etc.) for activity.
   Future<void> setControllerMonitoring(bool enabled) async {
     try {
       await _channel.invokeMethod('setControllerMonitoring', {
@@ -577,6 +584,9 @@ class WindowFocus {
   }
 
   /// Enables or disables system audio monitoring.
+  ///
+  /// When enabled, the plugin detects system audio output as a sign
+  /// of user activity (e.g., watching videos, listening to music).
   Future<void> setAudioMonitoring(bool enabled) async {
     try {
       await _channel.invokeMethod('setAudioMonitoring', {
@@ -604,6 +614,9 @@ class WindowFocus {
   }
 
   /// Sets the audio threshold for detecting user activity.
+  ///
+  /// The threshold is a float between 0.0 and 1.0. Audio peaks above
+  /// this value are considered as user activity. Default is 0.001.
   Future<void> setAudioThreshold(double threshold) async {
     try {
       await _channel.invokeMethod('setAudioThreshold', {
@@ -631,6 +644,11 @@ class WindowFocus {
   }
 
   /// Enables or disables HID device monitoring.
+  ///
+  /// When enabled, the plugin monitors HID devices like gaming wheels,
+  /// flight sticks, drawing tablets, and other specialty input devices.
+  /// Standard keyboards and mice are excluded since they are monitored
+  /// via dedicated hooks.
   Future<void> setHIDMonitoring(bool enabled) async {
     try {
       await _channel.invokeMethod('setHIDMonitoring', {
@@ -650,6 +668,47 @@ class WindowFocus {
         WindowFocusError(
           type: WindowFocusErrorType.configuration,
           message: 'Unexpected error setting HID monitoring: $e',
+          originalError: e,
+          stackTrace: stackTrace,
+        ),
+      );
+    }
+  }
+
+  /// Enables or disables keyboard input monitoring.
+  ///
+  /// When enabled, the plugin uses a low-level keyboard hook (`WH_KEYBOARD_LL`)
+  /// to detect keyboard input **system-wide**, including when other applications
+  /// are in focus. This is the primary method for detecting keyboard activity.
+  ///
+  /// A polling fallback using `GetAsyncKeyState` is also active to catch edge
+  /// cases where the hook might miss events (e.g., certain fullscreen games,
+  /// remote desktop sessions).
+  ///
+  /// The keyboard hook does NOT log or record which keys are pressed — it only
+  /// detects that keyboard activity occurred for the purpose of resetting the
+  /// inactivity timer.
+  ///
+  /// Enabled by default.
+  Future<void> setKeyboardMonitoring(bool enabled) async {
+    try {
+      await _channel.invokeMethod('setKeyboardMonitoring', {
+        'enabled': enabled,
+      });
+    } on PlatformException catch (e, stackTrace) {
+      _handleError(
+        WindowFocusError(
+          type: WindowFocusErrorType.configuration,
+          message: 'Failed to set keyboard monitoring: ${e.message}',
+          originalError: e,
+          stackTrace: stackTrace,
+        ),
+      );
+    } catch (e, stackTrace) {
+      _handleError(
+        WindowFocusError(
+          type: WindowFocusErrorType.configuration,
+          message: 'Unexpected error setting keyboard monitoring: $e',
           originalError: e,
           stackTrace: stackTrace,
         ),

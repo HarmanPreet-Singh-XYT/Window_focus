@@ -44,6 +44,7 @@ namespace window_focus {
 
 WindowFocusPlugin* WindowFocusPlugin::instance_ = nullptr;
 HHOOK WindowFocusPlugin::mouseHook_ = nullptr;
+HHOOK WindowFocusPlugin::keyboardHook_ = nullptr;
 
 using CallbackMethod = std::function<void(const std::wstring&)>;
 
@@ -225,9 +226,64 @@ static bool IsHandleValid(HANDLE handle) {
     }
 }
 
+// SEH-protected keyboard state check via GetAsyncKeyState
+static bool CheckKeyStateSEH(int vKey, bool* exceptionOccurred) {
+    *exceptionOccurred = false;
+    __try {
+        SHORT state = GetAsyncKeyState(vKey);
+        // Check if key is currently pressed (high-order bit)
+        return (state & 0x8000) != 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        *exceptionOccurred = true;
+        return false;
+    }
+}
+
+// SEH-protected GetKeyboardState wrapper
+static bool GetKeyboardStateSEH(BYTE* keyState, bool* exceptionOccurred) {
+    *exceptionOccurred = false;
+    __try {
+        return GetKeyboardState(keyState) ? true : false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        *exceptionOccurred = true;
+        return false;
+    }
+}
+
 // =====================================================================
 // End of SEH-isolated helpers
 // =====================================================================
+
+// Keyboard hook callback
+LRESULT CALLBACK WindowFocusPlugin::KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && instance_ && !instance_->isShuttingDown_) {
+        // wParam is WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, or WM_SYSKEYUP
+        if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+            if (instance_->enableDebug_) {
+                KBDLLHOOKSTRUCT* pKeyboard = (KBDLLHOOKSTRUCT*)lParam;
+                if (pKeyboard) {
+                    std::cout << "[WindowFocus] Keyboard hook: key down vkCode=" 
+                              << pKeyboard->vkCode << std::endl;
+                }
+            }
+            
+            instance_->UpdateLastActivityTime();
+            
+            // Update last key event time for polling fallback
+            auto now = std::chrono::steady_clock::now();
+            auto epoch = now.time_since_epoch();
+            instance_->lastKeyEventTime_ = std::chrono::duration_cast<std::chrono::milliseconds>(epoch).count();
+            
+            if (!instance_->userIsActive_) {
+                instance_->userIsActive_ = true;
+                instance_->SafeInvokeMethod("onUserActive", "User is active");
+            }
+        }
+    }
+    return CallNextHookEx(keyboardHook_, nCode, wParam, lParam);
+}
 
 LRESULT CALLBACK WindowFocusPlugin::MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
   if (nCode == HC_ACTION && instance_ && !instance_->isShuttingDown_) {
@@ -249,6 +305,7 @@ void WindowFocusPlugin::SetHooks() {
   }
   HINSTANCE hInstance = GetModuleHandle(nullptr);
 
+  // Install mouse hook
   mouseHook_ = SetWindowsHookEx(WH_MOUSE_LL, MouseProc, hInstance, 0);
   if (!mouseHook_) {
     std::cerr << "[WindowFocus] Failed to install mouse hook: " << GetLastError() << std::endl;
@@ -257,12 +314,26 @@ void WindowFocusPlugin::SetHooks() {
       std::cout << "[WindowFocus] Mouse hook installed successfully\n";
     }
   }
+
+  // Install keyboard hook
+  keyboardHook_ = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, hInstance, 0);
+  if (!keyboardHook_) {
+    std::cerr << "[WindowFocus] Failed to install keyboard hook: " << GetLastError() << std::endl;
+  } else {
+    if (instance_ && instance_->enableDebug_) {
+      std::cout << "[WindowFocus] Keyboard hook installed successfully\n";
+    }
+  }
 }
 
 void WindowFocusPlugin::RemoveHooks() {
   if (mouseHook_) {
     UnhookWindowsHookEx(mouseHook_);
     mouseHook_ = nullptr;
+  }
+  if (keyboardHook_) {
+    UnhookWindowsHookEx(keyboardHook_);
+    keyboardHook_ = nullptr;
   }
 }
 
@@ -412,7 +483,6 @@ WindowFocusPlugin::~WindowFocusPlugin() {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     auto elapsed = std::chrono::steady_clock::now() - waitStart;
     if (std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() > 2000) {
-      // Timeout after 2 seconds
       if (enableDebug_) {
         std::cerr << "[WindowFocus] Timeout waiting for threads to finish. Remaining: " 
                   << threadCount_.load() << std::endl;
@@ -517,6 +587,36 @@ void WindowFocusPlugin::HandleMethodCall(
             }
             monitorHIDDevices_ = newValue;
             std::cout << "[WindowFocus] HID device monitoring set to " << (monitorHIDDevices_ ? "true" : "false") << std::endl;
+            result->Success();
+            return;
+          }
+        }
+      }
+      result->Error("Invalid argument", "Expected a bool for 'enabled'.");
+      return;
+  }
+
+  // Set keyboard monitoring
+  if (method_name == "setKeyboardMonitoring") {
+      if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
+        auto it = args->find(flutter::EncodableValue("enabled"));
+        if (it != args->end()) {
+          if (std::holds_alternative<bool>(it->second)) {
+            monitorKeyboard_ = std::get<bool>(it->second);
+            std::cout << "[WindowFocus] Keyboard monitoring set to " << (monitorKeyboard_ ? "true" : "false") << std::endl;
+            
+            // Install or remove keyboard hook based on setting
+            if (monitorKeyboard_ && !keyboardHook_) {
+              HINSTANCE hInstance = GetModuleHandle(nullptr);
+              keyboardHook_ = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, hInstance, 0);
+              if (!keyboardHook_) {
+                std::cerr << "[WindowFocus] Failed to install keyboard hook: " << GetLastError() << std::endl;
+              }
+            } else if (!monitorKeyboard_ && keyboardHook_) {
+              UnhookWindowsHookEx(keyboardHook_);
+              keyboardHook_ = nullptr;
+            }
+            
             result->Success();
             return;
           }
@@ -655,6 +755,114 @@ bool WindowFocusPlugin::CheckRawInput() {
     return false;
 }
 
+// Check keyboard input via polling as a fallback to the hook
+// The hook is the primary detection method, but this catches edge cases
+// where the hook might miss events (e.g., certain fullscreen games)
+bool WindowFocusPlugin::CheckKeyboardInput() {
+    if (!monitorKeyboard_ || isShuttingDown_) {
+        return false;
+    }
+
+    bool inputDetected = false;
+
+    // Method 1: Check if the keyboard hook has recently detected input
+    // This is already handled by the hook callback, but we track it here
+    // for the polling thread to know about it
+    auto now = std::chrono::steady_clock::now();
+    auto epoch = now.time_since_epoch();
+    uint64_t currentTime = std::chrono::duration_cast<std::chrono::milliseconds>(epoch).count();
+    uint64_t lastKeyTime = lastKeyEventTime_.load();
+    
+    // If a key event happened within the last 200ms, consider it detected
+    if (lastKeyTime > 0 && (currentTime - lastKeyTime) < 200) {
+        return true;
+    }
+
+    // Method 2: Poll common keys using GetAsyncKeyState as fallback
+    // This catches cases where the low-level hook might not fire
+    // (some games, remote desktop, etc.)
+    
+    // Check alphanumeric keys (A-Z, 0-9)
+    bool exceptionOccurred = false;
+    
+    for (int vk = 0x41; vk <= 0x5A; vk++) { // A-Z
+        if (isShuttingDown_) return false;
+        if (CheckKeyStateSEH(vk, &exceptionOccurred)) {
+            if (!exceptionOccurred) {
+                if (enableDebug_) {
+                    std::cout << "[WindowFocus] Key detected (poll): vk=0x" 
+                              << std::hex << vk << std::dec << std::endl;
+                }
+                return true;
+            }
+        }
+        if (exceptionOccurred) break;
+    }
+
+    for (int vk = 0x30; vk <= 0x39; vk++) { // 0-9
+        if (isShuttingDown_) return false;
+        if (CheckKeyStateSEH(vk, &exceptionOccurred)) {
+            if (!exceptionOccurred) {
+                if (enableDebug_) {
+                    std::cout << "[WindowFocus] Number key detected (poll): vk=0x" 
+                              << std::hex << vk << std::dec << std::endl;
+                }
+                return true;
+            }
+        }
+        if (exceptionOccurred) break;
+    }
+
+    // Check function keys (F1-F12)
+    for (int vk = VK_F1; vk <= VK_F12; vk++) {
+        if (isShuttingDown_) return false;
+        if (CheckKeyStateSEH(vk, &exceptionOccurred)) {
+            if (!exceptionOccurred) {
+                if (enableDebug_) {
+                    std::cout << "[WindowFocus] Function key detected (poll): vk=0x" 
+                              << std::hex << vk << std::dec << std::endl;
+                }
+                return true;
+            }
+        }
+        if (exceptionOccurred) break;
+    }
+
+    // Check special keys
+    int specialKeys[] = {
+        VK_SPACE, VK_RETURN, VK_TAB, VK_ESCAPE, VK_BACK, VK_DELETE,
+        VK_SHIFT, VK_CONTROL, VK_MENU,         // Shift, Ctrl, Alt
+        VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU,
+        VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN,     // Arrow keys
+        VK_HOME, VK_END, VK_PRIOR, VK_NEXT,    // Home, End, PgUp, PgDn
+        VK_INSERT, VK_SNAPSHOT, VK_SCROLL, VK_PAUSE,
+        VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3, VK_NUMPAD4,
+        VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9,
+        VK_MULTIPLY, VK_ADD, VK_SUBTRACT, VK_DECIMAL, VK_DIVIDE,
+        VK_NUMLOCK, VK_CAPITAL,                 // Num Lock, Caps Lock
+        VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7,
+        VK_OEM_PLUS, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
+        VK_LWIN, VK_RWIN, VK_APPS              // Windows keys, Menu key
+    };
+
+    int numSpecialKeys = sizeof(specialKeys) / sizeof(specialKeys[0]);
+    for (int i = 0; i < numSpecialKeys; i++) {
+        if (isShuttingDown_) return false;
+        if (CheckKeyStateSEH(specialKeys[i], &exceptionOccurred)) {
+            if (!exceptionOccurred) {
+                if (enableDebug_) {
+                    std::cout << "[WindowFocus] Special key detected (poll): vk=0x" 
+                              << std::hex << specialKeys[i] << std::dec << std::endl;
+                }
+                return true;
+            }
+        }
+        if (exceptionOccurred) break;
+    }
+
+    return false;
+}
+
 bool WindowFocusPlugin::CheckSystemAudio() {
     if (!monitorAudio_ || isShuttingDown_) {
         return false;
@@ -774,7 +982,12 @@ void WindowFocusPlugin::InitializeHIDDevices() {
                         if (GetHIDCapsSEH(preparsedData, &caps)) {
                             bool isAudioDevice = (caps.UsagePage == 0x0B || caps.UsagePage == 0x0C);
                             
-                            if (!isAudioDevice && caps.InputReportByteLength > 0) {
+                            // Skip keyboard and mouse HID devices since we monitor
+                            // them via hooks and cursor position already
+                            bool isKeyboard = (caps.UsagePage == 0x01 && caps.Usage == 0x06);
+                            bool isMouse = (caps.UsagePage == 0x01 && caps.Usage == 0x02);
+                            
+                            if (!isAudioDevice && !isKeyboard && !isMouse && caps.InputReportByteLength > 0) {
                                 hidDeviceHandles_.push_back(deviceHandle);
                                 lastHIDStates_.push_back(std::vector<BYTE>(caps.InputReportByteLength, 0));
                                 
@@ -787,11 +1000,15 @@ void WindowFocusPlugin::InitializeHIDDevices() {
                                               << " Usage=0x" << caps.Usage << std::dec << std::endl;
                                 }
                             } else {
-                                if (enableDebug_ && isAudioDevice) {
-                                    std::cout << "[WindowFocus] Skipping audio device: VID=" 
+                                if (enableDebug_) {
+                                    const char* reason = isAudioDevice ? "audio" : 
+                                                        isKeyboard ? "keyboard" : 
+                                                        isMouse ? "mouse" : "no input";
+                                    std::cout << "[WindowFocus] Skipping HID device (" << reason << "): VID=" 
                                               << std::hex << attributes.VendorID 
                                               << " PID=" << attributes.ProductID 
-                                              << " UsagePage=0x" << caps.UsagePage << std::dec << std::endl;
+                                              << " UsagePage=0x" << caps.UsagePage 
+                                              << " Usage=0x" << caps.Usage << std::dec << std::endl;
                                 }
                                 CloseHandleSEH(deviceHandle);
                             }
@@ -839,7 +1056,6 @@ bool WindowFocusPlugin::CheckHIDDevices() {
         
         HANDLE deviceHandle = hidDeviceHandles_[i];
         
-        // Validate handle before use
         if (!IsHandleValid(deviceHandle)) {
             invalidDevices.push_back(i);
             continue;
@@ -898,7 +1114,6 @@ bool WindowFocusPlugin::CheckHIDDevices() {
                     invalidDevices.push_back(i);
                 }
             } else if (waitResult == WAIT_TIMEOUT) {
-                // Normal - no data available yet, cancel the pending I/O
                 CancelIoSEH(deviceHandle);
             } else if (waitResult == WAIT_FAILED) {
                 DWORD waitError = GetLastError();
@@ -932,7 +1147,7 @@ bool WindowFocusPlugin::CheckHIDDevices() {
         }
     }
     
-    // Remove invalid devices (iterate in reverse to preserve indices)
+    // Remove invalid devices
     if (!invalidDevices.empty()) {
         std::sort(invalidDevices.begin(), invalidDevices.end());
         invalidDevices.erase(std::unique(invalidDevices.begin(), invalidDevices.end()), invalidDevices.end());
@@ -1000,18 +1215,27 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
             bool inputDetected = false;
 
             try {
+                // Check keyboard input (polling fallback)
+                if (!isShuttingDown_ && CheckKeyboardInput()) {
+                    inputDetected = true;
+                }
+
+                // Check controllers (XInput)
                 if (!isShuttingDown_ && CheckControllerInput()) {
                     inputDetected = true;
                 }
 
+                // Check raw input (mouse movement via cursor position)
                 if (!isShuttingDown_ && CheckRawInput()) {
                     inputDetected = true;
                 }
 
+                // Check system audio
                 if (!isShuttingDown_ && CheckSystemAudio()) {
                     inputDetected = true;
                 }
 
+                // Check HID devices (Logitech G29, flight sticks, etc.)
                 if (!isShuttingDown_ && CheckHIDDevices()) {
                     inputDetected = true;
                 }
@@ -1188,7 +1412,7 @@ std::optional<std::vector<uint8_t>> WindowFocusPlugin::TakeScreenshot(bool activ
     int width = rc.right - rc.left;
     int height = rc.bottom - rc.top;
 
-    if (width <= 0 || height <= 0) {
+        if (width <= 0 || height <= 0) {
         DeleteDC(hdcMemDC);
         ReleaseDC(hwnd, hdcWindow);
         ReleaseDC(NULL, hdcScreen);

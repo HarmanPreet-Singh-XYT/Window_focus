@@ -91,6 +91,15 @@ public class WindowFocusPlugin: NSObject, FlutterPlugin {
                 result(FlutterError(code: "INVALID_ARGUMENT", message: "Expected 'enabled' parameter", details: nil))
             }
             
+        case "setKeyboardMonitoring":
+            if let args = call.arguments as? [String: Any],
+            let enabled = args["enabled"] as? Bool {
+                idleTracker?.setKeyboardMonitoring(enabled)
+                result(nil)
+            } else {
+                result(FlutterError(code: "INVALID_ARGUMENT", message: "Expected 'enabled' parameter", details: nil))
+            }
+            
         case "takeScreenshot":
             if let args = call.arguments as? [String: Any],
             let activeWindowOnly = args["activeWindowOnly"] as? Bool {
@@ -106,7 +115,6 @@ public class WindowFocusPlugin: NSObject, FlutterPlugin {
             requestScreenRecordingPermission()
             result(nil)
             
-        // NEW: Input Monitoring Permission
         case "checkInputMonitoringPermission":
             result(checkInputMonitoringPermission())
             
@@ -118,7 +126,6 @@ public class WindowFocusPlugin: NSObject, FlutterPlugin {
             openInputMonitoringSettings()
             result(nil)
                 
-        // NEW: Check all permissions at once
         case "checkAllPermissions":
             let permissions: [String: Bool] = [
                 "screenRecording": checkScreenRecordingPermission(),
@@ -130,9 +137,9 @@ public class WindowFocusPlugin: NSObject, FlutterPlugin {
             result(FlutterMethodNotImplemented)
         }
     }
+    
     private func checkInputMonitoringPermission() -> Bool {
         if #available(macOS 10.15, *) {
-            // IOHIDCheckAccess returns the current authorization status
             let status = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
             switch status {
             case kIOHIDAccessTypeGranted:
@@ -143,7 +150,6 @@ public class WindowFocusPlugin: NSObject, FlutterPlugin {
                 return false
             }
         }
-        // Before 10.15, Input Monitoring didn't exist as a separate permission
         return true
     }
 
@@ -152,16 +158,12 @@ public class WindowFocusPlugin: NSObject, FlutterPlugin {
             let status = IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)
             
             if status == kIOHIDAccessTypeUnknown {
-                // Request permission - this triggers the system dialog
                 IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
             } else if status == kIOHIDAccessTypeDenied {
-                // Already denied - open System Settings
                 openInputMonitoringSettings()
             }
-            // If granted, do nothing
         }
     }
-
 
     private func openInputMonitoringSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
@@ -349,15 +351,26 @@ public class IdleTracker: NSObject {
     private var debugMode: Bool = false
     private var userIsActive: Bool = true
 
-    // New monitoring flags
-    private var monitorControllers: Bool = true  // Controllers are detected via HID system
+    // Monitoring flags
+    private var monitorControllers: Bool = true
     private var monitorAudio: Bool = true
     private var monitorHIDDevices: Bool = true
+    private var monitorKeyboard: Bool = true
     private var audioThreshold: Float = 0.001
 
     // Event tap for keyboard/mouse
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
+
+    // Separate keyboard event tap (for when keyboard monitoring is toggled independently)
+    private var keyboardEventTap: CFMachPort?
+    private var keyboardRunLoopSource: CFRunLoopSource?
+
+    // Global/local event monitors
+    private var globalEventMonitor: Any?
+    private var localEventMonitor: Any?
+    private var keyboardGlobalMonitor: Any?
+    private var keyboardLocalMonitor: Any?
 
     // HID device tracking
     private var hidManager: IOHIDManager?
@@ -371,26 +384,37 @@ public class IdleTracker: NSObject {
     private var lastAudioLevel: Float = 0.0
     private var audioCheckTimer: Timer?
 
+    // Keyboard activity tracking
+    private var lastKeyboardActivityTime: Date = Date.distantPast
+    private var keyboardPollTimer: Timer?
+
     init(channel: FlutterMethodChannel) {
         self.channel = channel
         super.init()
         startTracking()
         setupEventTap()
+        setupKeyboardMonitoring()
         initializeHIDDevices()
         initializeAudioMonitoring()
         startInputMonitoring()
     }
 
+    // MARK: - Event Tap Setup
+
     private func setupEventTap() {
-        let eventMask = (1 << CGEventType.keyDown.rawValue) | 
-                         (1 << CGEventType.keyUp.rawValue) | 
-                         (1 << CGEventType.flagsChanged.rawValue) | 
-                         (1 << CGEventType.mouseMoved.rawValue) | 
-                         (1 << CGEventType.leftMouseDown.rawValue) | 
-                         (1 << CGEventType.rightMouseDown.rawValue)
+        // This event tap handles mouse events primarily
+        // Keyboard events are handled separately for independent toggling
+        let eventMask = (1 << CGEventType.mouseMoved.rawValue) |
+                         (1 << CGEventType.leftMouseDown.rawValue) |
+                         (1 << CGEventType.rightMouseDown.rawValue) |
+                         (1 << CGEventType.leftMouseUp.rawValue) |
+                         (1 << CGEventType.rightMouseUp.rawValue) |
+                         (1 << CGEventType.scrollWheel.rawValue) |
+                         (1 << CGEventType.leftMouseDragged.rawValue) |
+                         (1 << CGEventType.rightMouseDragged.rawValue)
         
         if debugMode {
-            print("[WindowFocus] Creating event tap with mask: \(eventMask)")
+            print("[WindowFocus] Creating mouse event tap with mask: \(eventMask)")
         }
 
         guard let eventTap = CGEvent.tapCreate(
@@ -402,7 +426,7 @@ public class IdleTracker: NSObject {
                 if let refcon = refcon {
                     let tracker = Unmanaged<IdleTracker>.fromOpaque(refcon).takeUnretainedValue()
                     if tracker.debugMode {
-                        print("[WindowFocus] EventTap detected event type: \(type.rawValue)")
+                        print("[WindowFocus] Mouse EventTap detected event type: \(type.rawValue)")
                     }
                     tracker.userDidInteract()
                 }
@@ -411,7 +435,7 @@ public class IdleTracker: NSObject {
             userInfo: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
         ) else {
             if debugMode {
-                print("[WindowFocus] Failed to create event tap with .cgAnnotatedSessionEventTap. Trying .cghidEventTap...")
+                print("[WindowFocus] Failed to create mouse event tap with .cgAnnotatedSessionEventTap. Trying .cghidEventTap...")
             }
             
             if let eventTapHid = CGEvent.tapCreate(
@@ -423,7 +447,7 @@ public class IdleTracker: NSObject {
                     if let refcon = refcon {
                         let tracker = Unmanaged<IdleTracker>.fromOpaque(refcon).takeUnretainedValue()
                         if tracker.debugMode {
-                            print("[WindowFocus] EventTap (HID) detected event type: \(type.rawValue)")
+                            print("[WindowFocus] Mouse EventTap (HID) detected event type: \(type.rawValue)")
                         }
                         tracker.userDidInteract()
                     }
@@ -432,28 +456,261 @@ public class IdleTracker: NSObject {
                 userInfo: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
             ) {
                 self.eventTap = eventTapHid
-                setupRunLoopSource(eventTapHid)
+                setupRunLoopSource(eventTapHid, source: &runLoopSource)
                 if debugMode {
-                    print("[WindowFocus] Event tap (HID) created successfully")
+                    print("[WindowFocus] Mouse event tap (HID) created successfully")
                 }
             } else {
-                print("[WindowFocus] Failed to create event tap. Check Accessibility permissions.")
+                print("[WindowFocus] Failed to create mouse event tap. Check Accessibility permissions.")
             }
             return
         }
 
         self.eventTap = eventTap
-        setupRunLoopSource(eventTap)
+        setupRunLoopSource(eventTap, source: &runLoopSource)
         if debugMode {
-            print("[WindowFocus] Event tap created successfully")
+            print("[WindowFocus] Mouse event tap created successfully")
         }
     }
 
-    private func setupRunLoopSource(_ eventTap: CFMachPort) {
-        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
+    // MARK: - Keyboard Monitoring Setup
+
+    private func setupKeyboardMonitoring() {
+        guard monitorKeyboard else {
+            if debugMode {
+                print("[WindowFocus] Keyboard monitoring is disabled, skipping setup")
+            }
+            return
+        }
+
+        // Method 1: CGEvent tap for keyboard events (system-wide, works across all apps)
+        setupKeyboardEventTap()
+
+        // Method 2: NSEvent monitors as fallback
+        setupKeyboardNSEventMonitors()
+
+        // Method 3: Polling fallback for edge cases
+        startKeyboardPolling()
+
+        if debugMode {
+            print("[WindowFocus] Keyboard monitoring setup complete (event tap + NSEvent monitors + polling)")
+        }
+    }
+
+    private func setupKeyboardEventTap() {
+        let keyboardEventMask = (1 << CGEventType.keyDown.rawValue) |
+                                 (1 << CGEventType.keyUp.rawValue) |
+                                 (1 << CGEventType.flagsChanged.rawValue)
+
+        if debugMode {
+            print("[WindowFocus] Creating keyboard event tap with mask: \(keyboardEventMask)")
+        }
+
+        guard let kbEventTap = CGEvent.tapCreate(
+            tap: .cgAnnotatedSessionEventTap,
+            place: .headInsertEventTap,
+            options: .listenOnly,
+            eventsOfInterest: CGEventMask(keyboardEventMask),
+            callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
+                if let refcon = refcon {
+                    let tracker = Unmanaged<IdleTracker>.fromOpaque(refcon).takeUnretainedValue()
+                    
+                    if tracker.monitorKeyboard {
+                        if tracker.debugMode {
+                            let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+                            switch type {
+                            case .keyDown:
+                                print("[WindowFocus] Keyboard: key down, keyCode=\(keyCode)")
+                            case .keyUp:
+                                print("[WindowFocus] Keyboard: key up, keyCode=\(keyCode)")
+                            case .flagsChanged:
+                                let flags = event.flags
+                                print("[WindowFocus] Keyboard: flags changed, flags=\(flags.rawValue)")
+                            default:
+                                print("[WindowFocus] Keyboard: event type \(type.rawValue)")
+                            }
+                        }
+                        
+                        tracker.lastKeyboardActivityTime = Date()
+                        tracker.userDidInteract()
+                    }
+                }
+                return Unmanaged.passUnretained(event)
+            },
+            userInfo: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        ) else {
+            if debugMode {
+                print("[WindowFocus] Failed to create keyboard event tap with .cgAnnotatedSessionEventTap. Trying .cghidEventTap...")
+            }
+
+            // Fallback to HID event tap
+            if let kbEventTapHid = CGEvent.tapCreate(
+                tap: .cghidEventTap,
+                place: .headInsertEventTap,
+                options: .listenOnly,
+                eventsOfInterest: CGEventMask(keyboardEventMask),
+                callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
+                    if let refcon = refcon {
+                        let tracker = Unmanaged<IdleTracker>.fromOpaque(refcon).takeUnretainedValue()
+                        if tracker.monitorKeyboard {
+                            if tracker.debugMode {
+                                print("[WindowFocus] Keyboard (HID tap): event type \(type.rawValue)")
+                            }
+                            tracker.lastKeyboardActivityTime = Date()
+                            tracker.userDidInteract()
+                        }
+                    }
+                    return Unmanaged.passUnretained(event)
+                },
+                userInfo: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+            ) {
+                self.keyboardEventTap = kbEventTapHid
+                setupRunLoopSource(kbEventTapHid, source: &keyboardRunLoopSource)
+                if debugMode {
+                    print("[WindowFocus] Keyboard event tap (HID) created successfully")
+                }
+            } else {
+                print("[WindowFocus] Failed to create keyboard event tap. Check Input Monitoring permissions.")
+                print("[WindowFocus] Will rely on NSEvent monitors and polling for keyboard detection.")
+            }
+            return
+        }
+
+        self.keyboardEventTap = kbEventTap
+        setupRunLoopSource(kbEventTap, source: &keyboardRunLoopSource)
+        if debugMode {
+            print("[WindowFocus] Keyboard event tap created successfully")
+        }
+    }
+
+    private func setupKeyboardNSEventMonitors() {
+        // Global monitor - catches keyboard events when OTHER apps are in focus
+        keyboardGlobalMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.keyDown, .keyUp, .flagsChanged]
+        ) { [weak self] event in
+            guard let self = self, self.monitorKeyboard else { return }
+            
+            if self.debugMode {
+                print("[WindowFocus] Keyboard (global NSEvent): keyCode=\(event.keyCode), type=\(event.type.rawValue)")
+            }
+            
+            self.lastKeyboardActivityTime = Date()
+            self.userDidInteract()
+        }
+
+        // Local monitor - catches keyboard events when OUR app is in focus
+        keyboardLocalMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.keyDown, .keyUp, .flagsChanged]
+        ) { [weak self] event in
+            guard let self = self, self.monitorKeyboard else { return event }
+            
+            if self.debugMode {
+                print("[WindowFocus] Keyboard (local NSEvent): keyCode=\(event.keyCode), type=\(event.type.rawValue)")
+            }
+            
+            self.lastKeyboardActivityTime = Date()
+            self.userDidInteract()
+            return event
+        }
+
+        if debugMode {
+            print("[WindowFocus] Keyboard NSEvent monitors installed")
+        }
+    }
+
+    private func startKeyboardPolling() {
+        // Polling fallback: check CGEventSource for keyboard idle time
+        // This catches cases where event taps might not fire
+        keyboardPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self = self, self.monitorKeyboard else { return }
+            self.pollKeyboardState()
+        }
+
+        if debugMode {
+            print("[WindowFocus] Keyboard polling started (0.5s interval)")
+        }
+    }
+
+    private func pollKeyboardState() {
+        // Check CGEventSource for recent keyboard activity
+        let keyboardIdleTime = CGEventSource.secondsSinceLastEventType(
+            .hidSystemState,
+            eventType: .keyDown
+        )
+
+        // If keyboard was used in the last 1 second, consider it activity
+        if keyboardIdleTime >= 0 && keyboardIdleTime < 1.0 {
+            let timeSinceLastKeyboard = Date().timeIntervalSince(lastKeyboardActivityTime)
+            
+            // Only trigger if we haven't already detected this via event tap/NSEvent
+            if timeSinceLastKeyboard > 1.0 {
+                if debugMode {
+                    print("[WindowFocus] Keyboard activity detected via polling (idle: \(String(format: "%.2f", keyboardIdleTime))s)")
+                }
+                lastKeyboardActivityTime = Date()
+                userDidInteract()
+            }
+        }
+
+        // Also check modifier keys (Shift, Ctrl, Alt, Cmd) via flagsChanged
+        let flagsIdleTime = CGEventSource.secondsSinceLastEventType(
+            .hidSystemState,
+            eventType: .flagsChanged
+        )
+
+        if flagsIdleTime >= 0 && flagsIdleTime < 1.0 {
+            let timeSinceLastKeyboard = Date().timeIntervalSince(lastKeyboardActivityTime)
+            if timeSinceLastKeyboard > 1.0 {
+                if debugMode {
+                    print("[WindowFocus] Modifier key activity detected via polling (idle: \(String(format: "%.2f", flagsIdleTime))s)")
+                }
+                lastKeyboardActivityTime = Date()
+                userDidInteract()
+            }
+        }
+    }
+
+    private func removeKeyboardMonitoring() {
+        // Remove keyboard event tap
+        if let kbTap = keyboardEventTap {
+            CGEvent.tapEnable(tap: kbTap, enable: false)
+            keyboardEventTap = nil
+        }
+        if let kbSource = keyboardRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), kbSource, .commonModes)
+            keyboardRunLoopSource = nil
+        }
+
+        // Remove NSEvent monitors
+        if let globalMonitor = keyboardGlobalMonitor {
+            NSEvent.removeMonitor(globalMonitor)
+            keyboardGlobalMonitor = nil
+        }
+        if let localMonitor = keyboardLocalMonitor {
+            NSEvent.removeMonitor(localMonitor)
+            keyboardLocalMonitor = nil
+        }
+
+        // Stop polling timer
+        keyboardPollTimer?.invalidate()
+        keyboardPollTimer = nil
+
+        if debugMode {
+            print("[WindowFocus] Keyboard monitoring removed")
+        }
+    }
+
+    // MARK: - Run Loop Source Helper
+
+    private func setupRunLoopSource(_ eventTap: CFMachPort, source: inout CFRunLoopSource?) {
+        source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
+        if let src = source {
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
+        }
         CGEvent.tapEnable(tap: eventTap, enable: true)
     }
+
+    // MARK: - HID Devices
 
     private func initializeHIDDevices() {
         guard monitorHIDDevices || monitorControllers else { return }
@@ -466,8 +723,6 @@ public class IdleTracker: NSObject {
             return
         }
 
-        // Match ALL HID devices - we'll filter out audio devices in the callback
-        // This is more reliable than trying to match specific device types
         IOHIDManagerSetDeviceMatching(manager, nil)
         
         IOHIDManagerRegisterDeviceMatchingCallback(manager, { context, result, sender, device in
@@ -495,7 +750,6 @@ public class IdleTracker: NSObject {
     }
 
     private func handleHIDDeviceAdded(_ device: IOHIDDevice) {
-        // Get device properties for filtering
         let usagePage = IOHIDDeviceGetProperty(device, kIOHIDDeviceUsagePageKey as CFString) as? Int ?? 0
         let usage = IOHIDDeviceGetProperty(device, kIOHIDDeviceUsageKey as CFString) as? Int ?? 0
         let vendorID = IOHIDDeviceGetProperty(device, kIOHIDVendorIDKey as CFString) as? Int ?? 0
@@ -508,38 +762,25 @@ public class IdleTracker: NSObject {
             print("  Usage Page: 0x\(String(usagePage, radix: 16)), Usage: 0x\(String(usage, radix: 16))")
         }
         
-        // Filter out devices we don't want to monitor
         var shouldMonitor = false
         
-        // Check if it's an audio/microphone device (exclude these)
-        let isAudioDevice = (usagePage == 0x0B || // Telephony (headsets, microphones)
-                            usagePage == 0x0C)     // Consumer (audio controls)
-        
-        // Check if it's a keyboard or mouse (already handled by event tap, but won't hurt)
+        let isAudioDevice = (usagePage == 0x0B || usagePage == 0x0C)
         let isKeyboard = (usagePage == 0x01 && usage == 0x06)
         let isMouse = (usagePage == 0x01 && usage == 0x02)
-        
-        // Game controllers and gamepads
         let isGameController = (usagePage == 0x01 && (usage == 0x04 || usage == 0x05 || usage == 0x08))
-        
-        // Digitizers (drawing tablets)
         let isDigitizer = (usagePage == 0x0D)
-        
-        // Multi-axis controllers (racing wheels, flight sticks)
         let isMultiAxisController = (usagePage == 0x01 && usage == 0x08)
-        
-        // Generic Desktop devices that aren't keyboard/mouse
         let isOtherDesktopDevice = (usagePage == 0x01 && !isKeyboard && !isMouse)
         
-        // Decide if we should monitor this device
         if monitorControllers && isGameController {
             shouldMonitor = true
             if debugMode {
                 print("[WindowFocus] → Game controller detected, will monitor")
             }
         } else if monitorHIDDevices {
-            // For HID monitoring, accept most input devices except audio
-            if !isAudioDevice {
+            // Skip keyboards and mice (monitored via event taps and NSEvent)
+            // Skip audio devices
+            if !isAudioDevice && !isKeyboard && !isMouse {
                 shouldMonitor = true
                 if debugMode {
                     if isDigitizer {
@@ -554,7 +795,13 @@ public class IdleTracker: NSObject {
                 }
             } else {
                 if debugMode {
-                    print("[WindowFocus] → Audio device, skipping")
+                    if isAudioDevice {
+                        print("[WindowFocus] → Audio device, skipping")
+                    } else if isKeyboard {
+                        print("[WindowFocus] → Keyboard (monitored via event tap), skipping HID")
+                    } else if isMouse {
+                        print("[WindowFocus] → Mouse (monitored via event tap), skipping HID")
+                    }
                 }
             }
         } else {
@@ -570,7 +817,6 @@ public class IdleTracker: NSObject {
         hidDevices.append(device)
         lastHIDStates[device] = Data()
         
-        // Register input value callback
         IOHIDDeviceRegisterInputValueCallback(device, { context, result, sender, value in
             guard let context = context, let sender = sender else { return }
             let tracker = Unmanaged<IdleTracker>.fromOpaque(context).takeUnretainedValue()
@@ -583,7 +829,7 @@ public class IdleTracker: NSObject {
     }
 
     private func handleHIDDeviceRemoved(_ device: IOHIDDevice) {
-        if let index = hidDevices.firstIndex(where: { $0 == device }) {
+        if let index = hidDevices.firstIndex(where: { \$0 == device }) {
             hidDevices.remove(at: index)
             lastHIDStates.removeValue(forKey: device)
             
@@ -606,10 +852,11 @@ public class IdleTracker: NSObject {
         userDidInteract()
     }
 
+    // MARK: - Audio Monitoring
+
     private func initializeAudioMonitoring() {
         guard monitorAudio else { return }
         
-        // Start a timer to periodically check system audio
         audioCheckTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.performAudioCheck()
         }
@@ -630,7 +877,6 @@ public class IdleTracker: NSObject {
     private func checkSystemAudio() -> Bool {
         guard monitorAudio else { return false }
         
-        // Get the default output device
         var defaultDeviceID = AudioDeviceID(0)
         var propertyAddress = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultOutputDevice,
@@ -655,13 +901,10 @@ public class IdleTracker: NSObject {
             return false
         }
         
-        // Check if the device is valid
         if defaultDeviceID == kAudioDeviceUnknown {
             return false
         }
         
-        // Get the device's current volume/peak level
-        // We'll check if there's any audio activity by looking at the device's running state
         propertyAddress.mSelector = kAudioDevicePropertyDeviceIsRunningSomewhere
         propertyAddress.mScope = kAudioObjectPropertyScopeGlobal
         
@@ -678,8 +921,6 @@ public class IdleTracker: NSObject {
         )
         
         if runningStatus == noErr && isRunning != 0 {
-            // Device is actively processing audio
-            // Now try to get the actual peak value if available
             propertyAddress.mSelector = kAudioDevicePropertyVolumeScalar
             propertyAddress.mScope = kAudioDevicePropertyScopeOutput
             
@@ -695,8 +936,6 @@ public class IdleTracker: NSObject {
                 &volume
             )
             
-            // If we can get volume and it's above threshold, or if the device is just running
-            // (which usually means audio is playing), consider it as activity
             if volumeStatus == noErr && volume > audioThreshold {
                 if debugMode {
                     print("[WindowFocus] Audio detected, volume: \(volume)")
@@ -704,8 +943,6 @@ public class IdleTracker: NSObject {
                 return true
             }
             
-            // Even if we can't get the exact volume, if the device is running, 
-            // it's likely playing audio
             if debugMode {
                 print("[WindowFocus] Audio device is running")
             }
@@ -715,16 +952,20 @@ public class IdleTracker: NSObject {
         return false
     }
 
+    // MARK: - Input Monitoring Start
+
     private func startInputMonitoring() {
-        // Background monitoring is now handled by:
-        // 1. HID callbacks for device input
-        // 2. Audio timer in initializeAudioMonitoring
-        // 3. Event tap for keyboard/mouse
-        
         if debugMode {
             print("[WindowFocus] Input monitoring started")
+            print("[WindowFocus]   Mouse: event tap")
+            print("[WindowFocus]   Keyboard: \(monitorKeyboard ? "event tap + NSEvent + polling" : "disabled")")
+            print("[WindowFocus]   Controllers: \(monitorControllers ? "HID" : "disabled")")
+            print("[WindowFocus]   HID devices: \(monitorHIDDevices ? "enabled" : "disabled")")
+            print("[WindowFocus]   Audio: \(monitorAudio ? "enabled" : "disabled")")
         }
     }
+
+    // MARK: - Tracking
 
     private func startTracking() {
         if let savedThreshold = UserDefaults.standard.object(forKey: "idleThreshold") as? TimeInterval {
@@ -735,11 +976,16 @@ public class IdleTracker: NSObject {
             print("[WindowFocus] Debug: Started tracking with idleThreshold = \(idleThreshold)")
         }
 
-        NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .rightMouseDown, .keyDown, .flagsChanged]) { [weak self] event in
+        // Mouse event monitors (always active)
+        globalEventMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.mouseMoved, .leftMouseDown, .rightMouseDown, .scrollWheel, .leftMouseDragged, .rightMouseDragged]
+        ) { [weak self] event in
             self?.userDidInteract()
         }
         
-        NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .rightMouseDown, .keyDown, .flagsChanged]) { [weak self] event in
+        localEventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.mouseMoved, .leftMouseDown, .rightMouseDown, .scrollWheel, .leftMouseDragged, .rightMouseDragged]
+        ) { [weak self] event in
             self?.userDidInteract()
             return event
         }
@@ -758,7 +1004,15 @@ public class IdleTracker: NSObject {
         let idleTime = min(safeCombined, safeHID, manualIdleTime)
 
         if debugMode {
-            print("[WindowFocus] Debug: Idle (C/H/M): \(String(format: "%.2f", safeCombined))/\(String(format: "%.2f", safeHID))/\(String(format: "%.2f", manualIdleTime)) -> Final: \(String(format: "%.2f", idleTime)), Threshold: \(idleThreshold), Active: \(userIsActive)")
+            let keyboardIdleStr: String
+            if monitorKeyboard {
+                let kbIdle = Date().timeIntervalSince(lastKeyboardActivityTime)
+                keyboardIdleStr = String(format: "%.2f", kbIdle)
+            } else {
+                keyboardIdleStr = "disabled"
+            }
+            
+            print("[WindowFocus] Debug: Idle (C/H/M/KB): \(String(format: "%.2f", safeCombined))/\(String(format: "%.2f", safeHID))/\(String(format: "%.2f", manualIdleTime))/\(keyboardIdleStr) -> Final: \(String(format: "%.2f", idleTime)), Threshold: \(idleThreshold), Active: \(userIsActive)")
         }
 
         if idleTime >= idleThreshold {
@@ -784,6 +1038,8 @@ public class IdleTracker: NSObject {
         lastActivityTime = Date()
     }
 
+    // MARK: - Configuration Methods
+
     func setIdleThreshold(_ threshold: TimeInterval) {
         self.idleThreshold = threshold
         UserDefaults.standard.set(threshold, forKey: "idleThreshold")
@@ -796,6 +1052,10 @@ public class IdleTracker: NSObject {
         self.debugMode = debug
         if debugMode {
             print("[WindowFocus] Debug mode enabled. Current idleThreshold = \(idleThreshold)")
+            print("[WindowFocus]   Keyboard monitoring: \(monitorKeyboard)")
+            print("[WindowFocus]   Controller monitoring: \(monitorControllers)")
+            print("[WindowFocus]   HID monitoring: \(monitorHIDDevices)")
+            print("[WindowFocus]   Audio monitoring: \(monitorAudio)")
         }
     }
 
@@ -811,10 +1071,8 @@ public class IdleTracker: NSObject {
         monitorAudio = enabled
         
         if enabled && !wasEnabled {
-            // Start audio monitoring
             initializeAudioMonitoring()
         } else if !enabled && wasEnabled {
-            // Stop audio monitoring
             audioCheckTimer?.invalidate()
             audioCheckTimer = nil
         }
@@ -844,10 +1102,37 @@ public class IdleTracker: NSObject {
         if debugMode {
             print("[WindowFocus] HID device monitoring set to \(enabled)")
             if enabled {
-                // Print diagnostic info
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                     self?.printConnectedDevices()
                 }
+            }
+        }
+    }
+
+    /// Enables or disables keyboard monitoring.
+    ///
+    /// When enabled, keyboard input is detected via three methods:
+    /// 1. **CGEvent tap** - system-wide, catches all keyboard events across all apps
+    /// 2. **NSEvent monitors** - global and local monitors as fallback
+    /// 3. **CGEventSource polling** - checks keyboard idle time as final fallback
+    ///
+    /// The keyboard monitoring does NOT log or record which keys are pressed —
+    /// it only detects that keyboard activity occurred for resetting the inactivity timer.
+    func setKeyboardMonitoring(_ enabled: Bool) {
+        let wasEnabled = monitorKeyboard
+        monitorKeyboard = enabled
+
+        if enabled && !wasEnabled {
+            // Enable keyboard monitoring
+            setupKeyboardMonitoring()
+            if debugMode {
+                print("[WindowFocus] Keyboard monitoring enabled")
+            }
+        } else if !enabled && wasEnabled {
+            // Disable keyboard monitoring
+            removeKeyboardMonitoring()
+            if debugMode {
+                print("[WindowFocus] Keyboard monitoring disabled")
             }
         }
     }
@@ -876,14 +1161,32 @@ public class IdleTracker: NSObject {
         }
     }
 
+    // MARK: - Cleanup
+
     deinit {
+        // Remove mouse event tap
         if let eventTap = eventTap {
             CGEvent.tapEnable(tap: eventTap, enable: false)
         }
         if let runLoopSource = runLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         }
+
+        // Remove keyboard monitoring
+        removeKeyboardMonitoring()
+
+        // Remove NSEvent monitors for mouse
+        if let globalMonitor = globalEventMonitor {
+            NSEvent.removeMonitor(globalMonitor)
+        }
+        if let localMonitor = localEventMonitor {
+            NSEvent.removeMonitor(localMonitor)
+        }
+
+        // Close HID devices
         closeHIDDevices()
+
+        // Stop timers
         audioCheckTimer?.invalidate()
         timer?.invalidate()
     }
