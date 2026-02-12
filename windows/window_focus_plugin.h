@@ -89,7 +89,7 @@ class WindowFocusPlugin : public flutter::Plugin {
   std::condition_variable shutdownCv_;
 
   // Methods
-  void SetHooks();
+  bool SetHooks();
   void RemoveHooks();
   void UpdateLastActivityTime();
 
