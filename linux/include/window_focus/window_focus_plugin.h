@@ -21,6 +21,8 @@ FLUTTER_PLUGIN_EXPORT GType window_focus_plugin_get_type();
 FLUTTER_PLUGIN_EXPORT void window_focus_plugin_register_with_registrar(
     FlPluginRegistrar* registrar);
 
+FLUTTER_PLUGIN_EXPORT FlMethodResponse* get_platform_version();
+
 G_END_DECLS
 
 #endif  // FLUTTER_PLUGIN_WINDOW_FOCUS_PLUGIN_H_

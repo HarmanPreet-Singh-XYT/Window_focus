@@ -7,6 +7,7 @@
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
 #include <sys/utsname.h>
+#include <cmath>
 
 #ifdef HAVE_PULSEAUDIO
 #include <pulse/pulseaudio.h>
@@ -47,7 +48,7 @@ enum class InputSource {
   Mouse,
   Joystick,
   HIDDevice,
-  Audio
+  SystemAudio
 };
 
 static const char* input_source_name(InputSource source) {
@@ -56,7 +57,7 @@ static const char* input_source_name(InputSource source) {
     case InputSource::Mouse: return "Mouse";
     case InputSource::Joystick: return "Joystick";
     case InputSource::HIDDevice: return "HID Device";
-    case InputSource::Audio: return "Audio";
+    case InputSource::SystemAudio: return "System Audio";
   }
   return "Unknown";
 }
@@ -71,7 +72,7 @@ struct _WindowFocusPlugin {
   bool monitorKeyboard;
   bool monitorMouse;
   bool monitorControllers;
-  bool monitorAudio;
+  bool monitorSystemAudio;
   bool monitorHIDDevices;
 
   // Thresholds
@@ -102,9 +103,9 @@ struct _WindowFocusPlugin {
   int lastMouseY;
   std::mutex mouseMutex;
 
-  // Audio
+  // System Audio
 #ifdef HAVE_PULSEAUDIO
-  pa_simple* audioStream;
+  pa_simple* systemAudioStream;
   std::mutex audioMutex;
 #endif
 
@@ -129,7 +130,7 @@ static void monitor_hid_devices_thread(WindowFocusPlugin* self);
 static void initialize_joysticks(WindowFocusPlugin* self);
 static void initialize_hid_devices(WindowFocusPlugin* self);
 static void close_input_devices(WindowFocusPlugin* self);
-static bool check_audio_input(WindowFocusPlugin* self);
+static bool check_system_audio(WindowFocusPlugin* self);
 static std::optional<std::vector<uint8_t>> take_screenshot(WindowFocusPlugin* self, bool activeWindowOnly);
 static int find_joystick_event_number(int js_fd);
 
@@ -791,107 +792,290 @@ static void monitor_hid_devices_thread(WindowFocusPlugin* self) {
   }).detach();
 }
 
-// Check audio input
-static bool check_audio_input(WindowFocusPlugin* self) {
+// Replace check_system_audio entirely with this version:
+static bool check_system_audio(WindowFocusPlugin* self) {
 #ifdef HAVE_PULSEAUDIO
-  if (!self->monitorAudio || self->isShuttingDown) {
+  if (!self->monitorSystemAudio || self->isShuttingDown) {
     return false;
   }
 
-  std::lock_guard<std::mutex> lock(self->audioMutex);
+  // Don't hold the mutex during the potentially long pa_simple_new
+  // Instead, check and create outside, then swap in
+  pa_simple* stream = nullptr;
 
-  if (!self->audioStream) {
+  {
+    std::lock_guard<std::mutex> lock(self->audioMutex);
+    stream = self->systemAudioStream;
+  }
+
+  if (!stream) {
+    if (self->enableDebug) {
+      std::cout << "[WindowFocus] Initializing system audio stream..." << std::endl;
+    }
+
     pa_sample_spec ss;
     ss.format = PA_SAMPLE_FLOAT32LE;
     ss.channels = 2;
     ss.rate = 44100;
 
+    // CRITICAL: Small fragment size for low-latency, non-blocking-ish reads
+    // 256 frames * 2 channels * 4 bytes = 2048 bytes = ~5.8ms of audio
     pa_buffer_attr attr;
     attr.maxlength = (uint32_t)-1;
     attr.tlength = (uint32_t)-1;
     attr.prebuf = (uint32_t)-1;
     attr.minreq = (uint32_t)-1;
-    attr.fragsize = sizeof(float) * 2 * 1024;
+    attr.fragsize = sizeof(float) * 2 * 256;
 
-    int error;
-    self->audioStream = pa_simple_new(nullptr, "WindowFocus", PA_STREAM_RECORD,
-                                      nullptr, "Monitor", &ss, nullptr, &attr, &error);
+    int error = 0;
+    pa_simple* new_stream = nullptr;
 
-    if (!self->audioStream) {
-      if (self->enableDebug) {
-        std::cerr << "[WindowFocus] Failed to create PulseAudio stream: "
-                  << pa_strerror(error) << std::endl;
+    // Step 1: Discover the actual default sink name
+    // On PipeWire, @DEFAULT_SINK@ might not resolve correctly for .monitor
+    std::string default_sink;
+    FILE* pipe = popen("pactl get-default-sink 2>/dev/null", "r");
+    if (pipe) {
+      char buf[512] = {0};
+      if (fgets(buf, sizeof(buf), pipe)) {
+        default_sink = buf;
+        // Trim whitespace/newline
+        while (!default_sink.empty() &&
+               (default_sink.back() == '\n' ||
+                default_sink.back() == '\r' ||
+                default_sink.back() == ' ')) {
+          default_sink.pop_back();
+        }
       }
+      pclose(pipe);
+    }
+
+    if (self->enableDebug) {
+      std::cout << "[WindowFocus] Detected default sink: '"
+                << default_sink << "'" << std::endl;
+    }
+
+    // Build list of sources to try, most specific first
+    std::vector<std::string> sources_to_try;
+
+    if (!default_sink.empty()) {
+      sources_to_try.push_back(default_sink + ".monitor");
+    }
+
+    // Also discover all available monitor sources
+        // Use awk with the field variable passed safely
+    FILE* src_pipe = popen(
+        "pactl list sources short 2>/dev/null | grep monitor | awk '{print $NF}' | head -20",
+        "r");
+    if (src_pipe) {
+      char buf[512];
+      while (fgets(buf, sizeof(buf), src_pipe)) {
+        std::string src(buf);
+        while (!src.empty() &&
+               (src.back() == '\n' || src.back() == '\r' || src.back() == ' ')) {
+          src.pop_back();
+        }
+        if (!src.empty()) {
+          // Avoid duplicates
+          bool already_listed = false;
+          for (const auto& existing : sources_to_try) {
+            if (existing == src) { already_listed = true; break; }
+          }
+          if (!already_listed) {
+            sources_to_try.push_back(src);
+          }
+        }
+      }
+      pclose(src_pipe);
+    }
+
+    // Fallback entries
+    sources_to_try.push_back("@DEFAULT_SINK@.monitor");
+    sources_to_try.push_back("@DEFAULT_MONITOR@");
+
+    if (self->enableDebug) {
+      std::cout << "[WindowFocus] Will try " << sources_to_try.size()
+                << " audio sources:" << std::endl;
+      for (const auto& s : sources_to_try) {
+        std::cout << "[WindowFocus]   - " << s << std::endl;
+      }
+    }
+
+    for (const auto& source : sources_to_try) {
+      if (self->isShuttingDown) return false;
+
+      if (self->enableDebug) {
+        std::cout << "[WindowFocus] Trying: " << source << std::endl;
+      }
+
+      new_stream = pa_simple_new(
+          nullptr,
+          "WindowFocusMonitor",
+          PA_STREAM_RECORD,
+          source.c_str(),
+          "System Audio Monitor",
+          &ss,
+          nullptr,
+          &attr,
+          &error);
+
+      if (new_stream) {
+        if (self->enableDebug) {
+          std::cout << "[WindowFocus] ✓ Connected to: " << source << std::endl;
+        }
+        break;
+      }
+
+      if (self->enableDebug) {
+        std::cerr << "[WindowFocus] ✗ Failed '" << source
+                  << "': " << pa_strerror(error) << std::endl;
+      }
+    }
+
+    if (!new_stream) {
+      std::cerr << "[WindowFocus] FAILED: Could not connect to any audio monitor source!"
+                << std::endl;
+      std::cerr << "[WindowFocus] Run: pactl list sources short" << std::endl;
       return false;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(self->audioMutex);
+      self->systemAudioStream = new_stream;
+      stream = new_stream;
+    }
+
+    if (self->enableDebug) {
+      std::cout << "[WindowFocus] Audio threshold: " << self->audioThreshold << std::endl;
+      std::cout << "[WindowFocus] Audio monitoring active!" << std::endl;
     }
   }
 
-  float buffer[1024 * 2];
+  // Read a small chunk — this blocks for ~5.8ms which is acceptable
+  const size_t num_frames = 256;
+  const size_t num_samples = num_frames * 2;  // stereo
+  float buffer[num_samples];
   int error;
 
-  if (pa_simple_read(self->audioStream, buffer, sizeof(buffer), &error) < 0) {
-    if (self->enableDebug) {
-      std::cerr << "[WindowFocus] Failed to read audio: " << pa_strerror(error) << std::endl;
+  if (pa_simple_read(stream, buffer, sizeof(buffer), &error) < 0) {
+    std::cerr << "[WindowFocus] Audio read error: " << pa_strerror(error) << std::endl;
+
+    std::lock_guard<std::mutex> lock(self->audioMutex);
+    if (self->systemAudioStream) {
+      pa_simple_free(self->systemAudioStream);
+      self->systemAudioStream = nullptr;
     }
-    // Reset the stream on error
-    pa_simple_free(self->audioStream);
-    self->audioStream = nullptr;
     return false;
   }
 
+  // Calculate peak AND RMS
   float peak = 0.0f;
-  for (size_t i = 0; i < 1024 * 2; i++) {
-    float abs_val = std::abs(buffer[i]);
-    if (abs_val > peak) {
-      peak = abs_val;
+  float sum_sq = 0.0f;
+
+  for (size_t i = 0; i < num_samples; i++) {
+    float v = std::abs(buffer[i]);
+    if (v > peak) peak = v;
+    sum_sq += buffer[i] * buffer[i];
+  }
+
+  float rms = std::sqrt(sum_sq / (float)num_samples);
+
+  // ALWAYS log periodically in debug mode so we know the thread is alive
+  if (self->enableDebug) {
+    static auto last_audio_log = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - last_audio_log).count();
+
+    // Log every 1 second OR when activity detected
+    if (ms >= 1000 || peak > self->audioThreshold) {
+      last_audio_log = now;
+      std::cout << "[WindowFocus] 🔊 Audio peak=" << peak
+                << " rms=" << rms
+                << " threshold=" << self->audioThreshold
+                << (peak > self->audioThreshold ? " *** DETECTED ***" : " (silent)")
+                << std::endl;
     }
   }
 
-  if (peak > self->audioThreshold) {
-    if (self->enableDebug) {
-      std::cout << "[WindowFocus] Audio detected, peak: " << peak << std::endl;
-    }
-    return true;
-  }
+  return peak > self->audioThreshold;
 
-  return false;
 #else
-  if (self->monitorAudio && self->enableDebug) {
-    static bool warning_shown = false;
-    if (!warning_shown) {
-      std::cerr << "[WindowFocus] Audio monitoring requested but PulseAudio support not compiled in" << std::endl;
-      warning_shown = true;
-    }
+  static bool warned = false;
+  if (self->monitorSystemAudio && !warned) {
+    std::cerr << "[WindowFocus] PulseAudio not compiled in! "
+              << "Rebuild with -DHAVE_PULSEAUDIO" << std::endl;
+    warned = true;
   }
   return false;
 #endif
 }
 
-// Audio monitoring thread
-static void monitor_audio_thread(WindowFocusPlugin* self) {
+
+// Replace monitor_system_audio_thread entirely:
+static void monitor_system_audio_thread(WindowFocusPlugin* self) {
   self->threadCount++;
 
   std::thread([self]() {
     if (self->enableDebug) {
-      std::cout << "[WindowFocus] Audio monitoring thread started" << std::endl;
+      std::cout << "[WindowFocus] System audio thread STARTED (thread ID: "
+                << std::this_thread::get_id() << ")" << std::endl;
     }
+
+    // Small delay to let the rest of initialization finish
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    int consecutive_detections = 0;
+    int read_count = 0;
 
     while (!self->isShuttingDown) {
-      if (self->monitorAudio && !self->isShuttingDown) {
-        if (check_audio_input(self)) {
-          report_activity(self, InputSource::Audio);
-        }
+      if (!self->monitorSystemAudio) {
+        std::unique_lock<std::mutex> lock(self->shutdownMutex);
+        self->shutdownCv.wait_for(lock, std::chrono::milliseconds(500),
+            [self] { return self->isShuttingDown.load(); });
+        continue;
       }
 
-      std::unique_lock<std::mutex> lock(self->shutdownMutex);
-      if (self->shutdownCv.wait_for(lock, std::chrono::milliseconds(100),
-          [self] { return self->isShuttingDown.load(); })) {
-        break;
+      bool detected = check_system_audio(self);
+      read_count++;
+
+      if (self->isShuttingDown) break;
+
+      if (detected) {
+        consecutive_detections++;
+        // Require 2+ consecutive detections to avoid false positives
+        if (consecutive_detections >= 2) {
+          report_activity(self, InputSource::SystemAudio);
+        }
+      } else {
+        consecutive_detections = 0;
       }
+
+      // Log thread health periodically
+      if (self->enableDebug && read_count % 500 == 0) {
+        std::cout << "[WindowFocus] Audio thread alive - "
+                  << read_count << " reads completed" << std::endl;
+      }
+
+      // pa_simple_read already blocks for ~5.8ms per read,
+      // so no additional sleep needed for responsive detection.
+      // But check shutdown between reads:
+      if (self->isShuttingDown) break;
     }
 
+    // Cleanup
+#ifdef HAVE_PULSEAUDIO
+    {
+      std::lock_guard<std::mutex> lock(self->audioMutex);
+      if (self->systemAudioStream) {
+        pa_simple_free(self->systemAudioStream);
+        self->systemAudioStream = nullptr;
+      }
+    }
+#endif
+
     if (self->enableDebug) {
-      std::cout << "[WindowFocus] Audio monitoring thread stopped" << std::endl;
+      std::cout << "[WindowFocus] System audio thread STOPPED ("
+                << read_count << " total reads)" << std::endl;
     }
     self->threadCount--;
   }).detach();
@@ -1079,42 +1263,42 @@ static void monitor_x11_events(WindowFocusPlugin* self) {
     }
 
     while (!self->isShuttingDown) {
-  bool activityDetected = false;
-  InputSource activitySource = InputSource::Keyboard;
+      bool activityDetected = false;
+      InputSource activitySource = InputSource::Keyboard;
 
-  // Check keyboard
-  if (self->monitorKeyboard) {
-    char keys[32];
-    XQueryKeymap(threadDisplay, keys);
+      // Check keyboard
+      if (self->monitorKeyboard) {
+        char keys[32];
+        XQueryKeymap(threadDisplay, keys);
 
-    // Detect ANY state change (press OR release)
-    bool keyStateChanged = false;
-    for (int i = 0; i < 32; i++) {
-      if (keys[i] != prevKeys[i]) {
-        keyStateChanged = true;
-        
-        if (self->enableDebug) {
-          // Show which byte changed for debugging
-          std::cout << "[WindowFocus] Keyboard state changed at byte " << i 
-                    << ": 0x" << std::hex << (int)(unsigned char)prevKeys[i] 
-                    << " -> 0x" << (int)(unsigned char)keys[i] 
-                    << std::dec << std::endl;
+        // Detect ANY state change (press OR release)
+        bool keyStateChanged = false;
+        for (int i = 0; i < 32; i++) {
+          if (keys[i] != prevKeys[i]) {
+            keyStateChanged = true;
+            
+            if (self->enableDebug) {
+              // Show which byte changed for debugging
+              std::cout << "[WindowFocus] Keyboard state changed at byte " << i 
+                        << ": 0x" << std::hex << (int)(unsigned char)prevKeys[i] 
+                        << " -> 0x" << (int)(unsigned char)keys[i] 
+                        << std::dec << std::endl;
+            }
+            break;
+          }
         }
-        break;
+
+        if (keyStateChanged) {
+          activityDetected = true;
+          activitySource = InputSource::Keyboard;
+
+          if (self->enableDebug) {
+            std::cout << "[WindowFocus] Keyboard input detected" << std::endl;
+          }
+        }
+
+        memcpy(prevKeys, keys, sizeof(prevKeys));
       }
-    }
-
-    if (keyStateChanged) {
-      activityDetected = true;
-      activitySource = InputSource::Keyboard;
-
-      if (self->enableDebug) {
-        std::cout << "[WindowFocus] Keyboard input detected" << std::endl;
-      }
-    }
-
-    memcpy(prevKeys, keys, sizeof(prevKeys));
-  }
 
       // Check mouse
       if (self->monitorMouse) {
@@ -1302,8 +1486,8 @@ static void start_monitoring_threads(WindowFocusPlugin* self) {
     monitor_hid_devices_thread(self); // HID device monitoring
   }
 
-  if (self->monitorAudio) {
-    monitor_audio_thread(self);     // Audio monitoring
+  if (self->monitorSystemAudio) {
+    monitor_system_audio_thread(self);     // System audio monitoring
   }
 }
 
@@ -1334,9 +1518,9 @@ static void stop_monitoring_threads(WindowFocusPlugin* self) {
 #ifdef HAVE_PULSEAUDIO
   {
     std::lock_guard<std::mutex> lock(self->audioMutex);
-    if (self->audioStream) {
-      pa_simple_free(self->audioStream);
-      self->audioStream = nullptr;
+    if (self->systemAudioStream) {
+      pa_simple_free(self->systemAudioStream);
+      self->systemAudioStream = nullptr;
     }
   }
 #endif
@@ -1405,17 +1589,18 @@ static void window_focus_plugin_handle_method_call(
       }
     }
   } else if (strcmp(method, "setAudioMonitoring") == 0) {
+    // Note: Flutter side calls this "setAudioMonitoring" but we're monitoring system audio output
     if (fl_value_get_type(args) == FL_VALUE_TYPE_MAP) {
       FlValue* enabled_val = fl_value_lookup_string(args, "enabled");
       if (enabled_val && fl_value_get_type(enabled_val) == FL_VALUE_TYPE_BOOL) {
         bool newValue = fl_value_get_bool(enabled_val);
-        if (newValue && !self->monitorAudio) {
-          self->monitorAudio = true;
-          monitor_audio_thread(self);
+        if (newValue && !self->monitorSystemAudio) {
+          self->monitorSystemAudio = true;
+          monitor_system_audio_thread(self);
         } else {
-          self->monitorAudio = newValue;
+          self->monitorSystemAudio = newValue;
         }
-        std::cout << "[WindowFocus] Audio monitoring set to " << (self->monitorAudio ? "true" : "false") << std::endl;
+        std::cout << "[WindowFocus] System audio monitoring set to " << (self->monitorSystemAudio ? "true" : "false") << std::endl;
         response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
       } else {
         response = FL_METHOD_RESPONSE(fl_method_error_response_new("Invalid argument", "Expected a bool for 'enabled'", nullptr));
@@ -1496,7 +1681,7 @@ static void window_focus_plugin_handle_method_call(
     fl_value_set_string_take(status, "keyboard", fl_value_new_bool(self->monitorKeyboard));
     fl_value_set_string_take(status, "mouse", fl_value_new_bool(self->monitorMouse));
     fl_value_set_string_take(status, "controllers", fl_value_new_bool(self->monitorControllers));
-    fl_value_set_string_take(status, "audio", fl_value_new_bool(self->monitorAudio));
+    fl_value_set_string_take(status, "systemAudio", fl_value_new_bool(self->monitorSystemAudio));
     fl_value_set_string_take(status, "hidDevices", fl_value_new_bool(self->monitorHIDDevices));
     fl_value_set_string_take(status, "userIsActive", fl_value_new_bool(self->userIsActive.load()));
     fl_value_set_string_take(status, "threadCount", fl_value_new_int(self->threadCount.load()));
@@ -1548,9 +1733,6 @@ static void window_focus_plugin_dispose(GObject* object) {
     }
   }
 
-  // Note: we do NOT close self->display here because we no longer have one.
-  // Each thread opens and closes its own Display connection.
-
   if (self->enableDebug) {
     std::cout << "[WindowFocus] Plugin disposed" << std::endl;
   }
@@ -1568,7 +1750,7 @@ static void window_focus_plugin_init(WindowFocusPlugin* self) {
   self->monitorKeyboard = true;
   self->monitorMouse = true;
   self->monitorControllers = true;
-  self->monitorAudio = false;
+  self->monitorSystemAudio = false;
   self->monitorHIDDevices = false;
   self->inactivityThreshold = 60000; // 60 seconds
   self->audioThreshold = 0.01f;
@@ -1585,11 +1767,8 @@ static void window_focus_plugin_init(WindowFocusPlugin* self) {
   memset(self->lastKeyState, 0, sizeof(self->lastKeyState));
 
 #ifdef HAVE_PULSEAUDIO
-  self->audioStream = nullptr;
+  self->systemAudioStream = nullptr;
 #endif
-
-  // Note: No shared Display* — each thread opens its own connection
-  // This is the key fix for X11 thread safety
 }
 
 static void method_call_cb(FlMethodChannel* channel, FlMethodCall* method_call,
