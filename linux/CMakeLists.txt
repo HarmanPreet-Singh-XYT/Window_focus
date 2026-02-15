@@ -41,6 +41,37 @@ target_include_directories(${PLUGIN_NAME} INTERFACE
 target_link_libraries(${PLUGIN_NAME} PRIVATE flutter)
 target_link_libraries(${PLUGIN_NAME} PRIVATE PkgConfig::GTK)
 
+# Find required packages
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(X11 REQUIRED x11)
+pkg_check_modules(XI REQUIRED xi)
+pkg_check_modules(XTST REQUIRED xtst)
+
+# PulseAudio is optional - if not found, audio monitoring will be disabled
+pkg_check_modules(PULSE libpulse libpulse-simple)
+
+# Link X11 and XInput libraries
+target_include_directories(${PLUGIN_NAME} PRIVATE ${X11_INCLUDE_DIRS} ${XI_INCLUDE_DIRS} ${XTST_INCLUDE_DIRS})
+target_link_libraries(${PLUGIN_NAME} PRIVATE ${X11_LIBRARIES} ${XI_LIBRARIES} ${XTST_LIBRARIES})
+
+# If PulseAudio is found, enable audio support
+if(PULSE_FOUND)
+  message(STATUS "PulseAudio found - audio monitoring enabled")
+  target_compile_definitions(${PLUGIN_NAME} PRIVATE HAVE_PULSEAUDIO)
+  target_include_directories(${PLUGIN_NAME} PRIVATE ${PULSE_INCLUDE_DIRS})
+  target_link_libraries(${PLUGIN_NAME} PRIVATE ${PULSE_LIBRARIES})
+else()
+  message(WARNING "PulseAudio not found - audio monitoring will be disabled")
+  message(WARNING "To enable audio monitoring, install: sudo apt-get install libpulse-dev")
+endif()
+
+# Enable C++17
+set_target_properties(${PLUGIN_NAME} PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED YES
+  CXX_EXTENSIONS NO
+)
+
 # List of absolute paths to libraries that should be bundled with the plugin.
 # This list could contain prebuilt libraries, or libraries created by an
 # external build triggered from this build file.
@@ -51,7 +82,6 @@ set(window_focus_bundled_libraries
 
 # === Tests ===
 # These unit tests can be run from a terminal after building the example.
-
 # Only enable test builds when building the example (which sets this variable)
 # so that plugin clients aren't building the tests.
 if (${include_${PROJECT_NAME}_tests})
@@ -71,7 +101,6 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 # Disable install commands for gtest so it doesn't end up in the bundle.
 set(INSTALL_GTEST OFF CACHE BOOL "Disable installation of googletest" FORCE)
-
 FetchContent_MakeAvailable(googletest)
 
 # The plugin's exported API is not very useful for unit testing, so build the
@@ -84,11 +113,15 @@ apply_standard_settings(${TEST_RUNNER})
 target_include_directories(${TEST_RUNNER} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(${TEST_RUNNER} PRIVATE flutter)
 target_link_libraries(${TEST_RUNNER} PRIVATE PkgConfig::GTK)
+target_link_libraries(${TEST_RUNNER} PRIVATE ${X11_LIBRARIES} ${XI_LIBRARIES} ${XTST_LIBRARIES})
+if(PULSE_FOUND)
+  target_compile_definitions(${TEST_RUNNER} PRIVATE HAVE_PULSEAUDIO)
+  target_link_libraries(${TEST_RUNNER} PRIVATE ${PULSE_LIBRARIES})
+endif()
 target_link_libraries(${TEST_RUNNER} PRIVATE gtest_main gmock)
 
 # Enable automatic test discovery.
 include(GoogleTest)
 gtest_discover_tests(${TEST_RUNNER})
-
 endif()  # CMake version check
 endif()  # include_${PROJECT_NAME}_tests
