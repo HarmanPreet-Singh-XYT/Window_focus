@@ -25,7 +25,7 @@
 #include <gdiplus.h>
 #include <setupapi.h>
 #include <hidclass.h>
-#include <functiondiscoverykeys_devpkey.h>
+
 #include <mutex>
 #include <atomic>
 #include <condition_variable>
