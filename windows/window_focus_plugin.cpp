@@ -31,7 +31,8 @@
 #include <condition_variable>
 #include <functional>
 #include <queue>
-
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "XInput.lib")
 #pragma comment(lib, "setupapi.lib")
