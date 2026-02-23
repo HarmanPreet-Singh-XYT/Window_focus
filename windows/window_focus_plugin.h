@@ -5,118 +5,117 @@
 #include <flutter/plugin_registrar_windows.h>
 #include <flutter/standard_method_codec.h>
 #include <flutter/encodable_value.h>
-
-#include <Windows.h>
+#include <windows.h>
 #include <xinput.h>
-#include <endpointvolume.h>
-#include <mmdeviceapi.h>
 #include <hidsdi.h>
+#include <hidpi.h>
 
 #include <memory>
 #include <string>
-#include <optional>
 #include <vector>
 #include <mutex>
 #include <atomic>
-#include <chrono>
 #include <condition_variable>
+#include <functional>
+#include <optional>
+#include <chrono>
 
 namespace window_focus {
 
-class WindowFocusPlugin : public flutter::Plugin {
- public:
-  static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar);
+int GetEncoderClsid(const WCHAR* format, CLSID* pClsid);
+std::string ConvertWindows1251ToUTF8(const std::string& windows1251_str);
+std::string ConvertWStringToUTF8(const std::wstring& wstr);
+std::string GetFocusedWindowTitle();
+std::string GetFocusedWindowAppName();
+std::string GetProcessName(DWORD processID);
 
-  WindowFocusPlugin();
-  virtual ~WindowFocusPlugin();
+// FIX: Inherit from std::enable_shared_from_this so background threads can
+// safely extend the plugin's lifetime via shared_ptr rather than raw pointers.
+class WindowFocusPlugin : public flutter::Plugin,
+                          public std::enable_shared_from_this<WindowFocusPlugin> {
+public:
+    static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar);
 
-  // Disallow copy and assign.
-  WindowFocusPlugin(const WindowFocusPlugin&) = delete;
-  WindowFocusPlugin& operator=(const WindowFocusPlugin&) = delete;
+    WindowFocusPlugin();
+    virtual ~WindowFocusPlugin();
 
-  // Method channel
-  std::shared_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel;
+    // Disallow copy/move.
+    WindowFocusPlugin(const WindowFocusPlugin&) = delete;
+    WindowFocusPlugin& operator=(const WindowFocusPlugin&) = delete;
 
-  // Static members for hooks
-  static WindowFocusPlugin* instance_;
-  static HHOOK mouseHook_;
-  static HHOOK keyboardHook_;
-  static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam);
-  static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
+    void HandleMethodCall(
+        const flutter::MethodCall<flutter::EncodableValue>& method_call,
+        std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
 
-  // Debug flag
-  std::atomic<bool> enableDebug_{false};
+    // Public so thread lambdas can call them after promoting the weak_ptr.
+    void SafeInvokeMethod(const std::string& methodName, const std::string& message);
+    void SafeInvokeMethodWithMap(const std::string& methodName, flutter::EncodableMap data);
+    void PostToMainThread(std::function<void()> task);
+    void UpdateLastActivityTime();
 
-  // Activity tracking
-  std::atomic<bool> userIsActive_{true};
-  std::chrono::steady_clock::time_point lastActivityTime;
-  std::mutex activityMutex_;
+    std::shared_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel;
 
-  // Inactivity threshold in milliseconds
-  int inactivityThreshold_ = 60000;
+    // ---------- state accessed by threads ----------
+    std::atomic<bool> isShuttingDown_;
+    std::atomic<bool> userIsActive_;
+    std::atomic<int>  threadCount_;
+    std::atomic<uint64_t> lastKeyEventTime_{ 0 };
 
-  // Controller monitoring
-  std::atomic<bool> monitorControllers_{true};
-  XINPUT_STATE lastControllerStates_[XUSER_MAX_COUNT];
+    bool enableDebug_ = false;
+    bool monitorControllers_ = true;
+    bool monitorAudio_ = true;
+    bool monitorKeyboard_ = true;
+    bool monitorHIDDevices_ = false;
+    float audioThreshold_ = 0.01f;
+    int inactivityThreshold_ = 60000; // ms
 
-  // Audio monitoring
-  std::atomic<bool> monitorAudio_{false};
-  float audioThreshold_ = 0.01f;
+    std::chrono::steady_clock::time_point lastActivityTime;
+    std::mutex activityMutex_;
 
-  // HID device monitoring
-  std::atomic<bool> monitorHIDDevices_{true};
-  std::vector<HANDLE> hidDeviceHandles_;
-  std::vector<std::vector<BYTE>> lastHIDStates_;
-  std::mutex hidDevicesMutex_;
+    std::mutex channelMutex_;
+    std::mutex screenshotMutex_;
+    std::mutex mouseMutex_;
 
-  // Keyboard monitoring
-  std::atomic<bool> monitorKeyboard_{true};
-  std::atomic<uint64_t> lastKeyEventTime_{0};
+    std::mutex shutdownMutex_;
+    std::condition_variable shutdownCv_;
 
-  // Mouse tracking
-  POINT lastMousePosition_;
-  std::mutex mouseMutex_;
+    POINT lastMousePosition_ = { 0, 0 };
+    XINPUT_STATE lastControllerStates_[XUSER_MAX_COUNT] = {};
 
-  // Channel mutex
-  std::mutex channelMutex_;
+    std::vector<HANDLE> hidDeviceHandles_;
+    std::vector<std::vector<BYTE>> lastHIDStates_;
+    std::mutex hidDevicesMutex_;
 
-  // Shutdown flag
-  std::atomic<bool> isShuttingDown_;
+private:
+    // Hook callbacks (static so they can be passed to SetWindowsHookEx).
+    static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam);
 
-  // Thread tracking and shutdown synchronization
-  std::atomic<int> threadCount_;
-  std::mutex shutdownMutex_;
-  std::condition_variable shutdownCv_;
+    void SetHooks();
+    void RemoveHooks();
 
-  // Methods
-  void SetHooks();
-  void RemoveHooks();
-  void UpdateLastActivityTime();
+    void CheckForInactivity();
+    void StartFocusListener();
+    void MonitorAllInputDevices();
 
-  void HandleMethodCall(
-      const flutter::MethodCall<flutter::EncodableValue>& method_call,
-      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+    bool CheckControllerInput();
+    bool CheckRawInput();
+    bool CheckKeyboardInput();
+    bool CheckSystemAudio();
+    bool CheckHIDDevices();
 
-  // Safe method invocation helpers
-  void SafeInvokeMethod(const std::string& methodName, const std::string& message);
-  void SafeInvokeMethodWithMap(const std::string& methodName, flutter::EncodableMap& data);
+    void InitializeHIDDevices();
+    void CloseHIDDevices();
 
-  // Input monitoring
-  bool CheckControllerInput();
-  bool CheckRawInput();
-  bool CheckSystemAudio();
-  bool CheckKeyboardInput();
-  void InitializeHIDDevices();
-  bool CheckHIDDevices();
-  void CloseHIDDevices();
-  void MonitorAllInputDevices();
+    std::optional<std::vector<uint8_t>> TakeScreenshot(bool activeWindowOnly);
 
-  // Inactivity and focus
-  void CheckForInactivity();
-  void StartFocusListener();
+    // FIX: weak_ptr + mutex replace the old raw atomic pointer.
+    // Hooks promote this to a shared_ptr; if promotion fails the plugin is gone.
+    static std::weak_ptr<WindowFocusPlugin> instance_;
+    static std::mutex instanceMutex_;
 
-  // Screenshot
-  std::optional<std::vector<uint8_t>> TakeScreenshot(bool activeWindowOnly);
+    static HHOOK mouseHook_;
+    static HHOOK keyboardHook_;
 };
 
 }  // namespace window_focus
