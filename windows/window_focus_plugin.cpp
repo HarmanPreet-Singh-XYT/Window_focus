@@ -1,9 +1,6 @@
 #include "window_focus_plugin.h"
 
-// This must be included before many other Windows headers.
 #include <windows.h>
-
-// For getPlatformVersion; remove unless needed for your plugin implementation.
 #include <VersionHelpers.h>
 
 #include <flutter/method_channel.h>
@@ -11,14 +8,12 @@
 #include <flutter/standard_method_codec.h>
 #include <flutter/binary_messenger.h>
 #include <flutter/encodable_value.h>
-#include <Windows.h>
 #include <xinput.h>
 
 #include <iostream>
 #include <memory>
 #include <string>
 #include <thread>
-#include <codecvt>
 #include <locale>
 #include <optional>
 #include <tlhelp32.h>
@@ -44,7 +39,6 @@
 
 namespace window_focus {
 
-// Forward declaration to fix missing declaration before use in TakeScreenshot.
 int GetEncoderClsid(const WCHAR* format, CLSID* pClsid);
 
 // =====================================================================
@@ -58,7 +52,12 @@ HHOOK WindowFocusPlugin::keyboardHook_ = nullptr;
 using CallbackMethod = std::function<void(const std::wstring&)>;
 
 // =====================================================================
-// SEH-isolated helper functions (no C++ objects with destructors allowed)
+// SEH-isolated helper functions
+//
+// WARNING: These functions use SEH (__try/__except). Do NOT place C++
+// objects with destructors (std::string, std::vector, RAII wrappers,
+// etc.) inside __try blocks — mixing SEH with C++ destructors is
+// undefined behaviour under MSVC.
 // =====================================================================
 
 static bool ReadHIDDeviceSEH(HANDLE deviceHandle, BYTE* buffer, DWORD bufferSize,
@@ -124,6 +123,16 @@ static bool GetHIDCapsSEH(PHIDP_PREPARSED_DATA preparsedData, HIDP_CAPS* caps) {
     }
 }
 
+static bool FreePreparsedDataSEH(PHIDP_PREPARSED_DATA preparsedData) {
+    __try {
+        HidD_FreePreparsedData(preparsedData);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 static bool GetAudioPeakValueSEH(float* peakValue, bool* comErrorOut) {
     IMMDeviceEnumerator* deviceEnumerator = nullptr;
     IMMDevice* defaultDevice = nullptr;
@@ -135,28 +144,16 @@ static bool GetAudioPeakValueSEH(float* peakValue, bool* comErrorOut) {
 
     __try {
         HRESULT hr = CoCreateInstance(
-            __uuidof(MMDeviceEnumerator),
-            nullptr,
-            CLSCTX_ALL,
-            __uuidof(IMMDeviceEnumerator),
-            (void**)&deviceEnumerator
-        );
+            __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+            __uuidof(IMMDeviceEnumerator), (void**)&deviceEnumerator);
 
         if (SUCCEEDED(hr) && deviceEnumerator) {
-            hr = deviceEnumerator->GetDefaultAudioEndpoint(
-                eRender, eConsole, &defaultDevice
-            );
+            hr = deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &defaultDevice);
         }
-
         if (SUCCEEDED(hr) && defaultDevice) {
-            hr = defaultDevice->Activate(
-                __uuidof(IAudioMeterInformation),
-                CLSCTX_ALL,
-                nullptr,
-                (void**)&meterInfo
-            );
+            hr = defaultDevice->Activate(__uuidof(IAudioMeterInformation),
+                CLSCTX_ALL, nullptr, (void**)&meterInfo);
         }
-
         if (SUCCEEDED(hr) && meterInfo) {
             hr = meterInfo->GetPeakValue(peakValue);
             success = SUCCEEDED(hr);
@@ -187,15 +184,9 @@ static DWORD XInputGetStateSEH(DWORD dwUserIndex, XINPUT_STATE* pState, bool* ex
 
 static HANDLE CreateHIDDeviceHandleSEH(const WCHAR* devicePath) {
     __try {
-        return CreateFileW(
-            devicePath,
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            nullptr,
-            OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED,
-            nullptr
-        );
+        return CreateFileW(devicePath, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+            OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         return INVALID_HANDLE_VALUE;
@@ -221,9 +212,7 @@ static bool CancelIoSEH(HANDLE handle) {
 }
 
 static bool IsHandleValid(HANDLE handle) {
-    if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
-        return false;
-    }
+    if (handle == nullptr || handle == INVALID_HANDLE_VALUE) return false;
     __try {
         DWORD flags = 0;
         return GetHandleInformation(handle, &flags) ? true : false;
@@ -245,22 +234,81 @@ static bool CheckKeyStateSEH(int vKey, bool* exceptionOccurred) {
     }
 }
 
-static bool GetKeyboardStateSEH(BYTE* keyState, bool* exceptionOccurred) {
-    *exceptionOccurred = false;
-    __try {
-        return GetKeyboardState(keyState) ? true : false;
+// =====================================================================
+// RAII helper for overlapped HID reads
+// =====================================================================
+struct OverlappedGuard {
+    OVERLAPPED ovl{};
+    HANDLE hEvent = nullptr;
+    HANDLE deviceHandle = INVALID_HANDLE_VALUE;
+    bool completed = false;
+
+    OverlappedGuard(HANDLE dev) : deviceHandle(dev) {
+        hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        if (hEvent) {
+            ovl.hEvent = hEvent;
+        }
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        *exceptionOccurred = true;
-        return false;
+
+    // Increase wait or make it infinite after CancelIo
+    ~OverlappedGuard() {
+        if (!completed && deviceHandle != INVALID_HANDLE_VALUE) {
+            CancelIoSEH(deviceHandle);
+        }
+        if (hEvent) {
+            if (!completed) {
+                WaitForSingleObject(hEvent, INFINITE); // CancelIo guarantees completion
+            }
+            CloseHandleSEH(hEvent);
+        }
     }
-}
+
+    bool IsValid() const { return hEvent != nullptr; }
+    void MarkComplete() { completed = true; }
+    OVERLAPPED* Get() { return &ovl; }
+
+    OverlappedGuard(const OverlappedGuard&) = delete;
+    OverlappedGuard& operator=(const OverlappedGuard&) = delete;
+};
 
 // =====================================================================
-// PlatformTaskDispatcher - thread-safe task marshalling to the UI thread.
+// RAII helper for GDI DC handles
+// =====================================================================
+struct ReleaseDCGuard {
+    HWND hwnd;
+    HDC hdc;
+    ReleaseDCGuard(HWND w, HDC d) : hwnd(w), hdc(d) {}
+    ~ReleaseDCGuard() { if (hdc) ReleaseDC(hwnd, hdc); }
+    ReleaseDCGuard(const ReleaseDCGuard&) = delete;
+    ReleaseDCGuard& operator=(const ReleaseDCGuard&) = delete;
+};
+
+struct DeleteDCGuard {
+    HDC hdc;
+    explicit DeleteDCGuard(HDC d) : hdc(d) {}
+    ~DeleteDCGuard() { if (hdc) DeleteDC(hdc); }
+    DeleteDCGuard(const DeleteDCGuard&) = delete;
+    DeleteDCGuard& operator=(const DeleteDCGuard&) = delete;
+};
+
+struct DeleteObjectGuard {
+    HGDIOBJ obj;
+    explicit DeleteObjectGuard(HGDIOBJ o) : obj(o) {}
+    ~DeleteObjectGuard() { if (obj) DeleteObject(obj); }
+    DeleteObjectGuard(const DeleteObjectGuard&) = delete;
+    DeleteObjectGuard& operator=(const DeleteObjectGuard&) = delete;
+};
+
+// =====================================================================
+// PlatformTaskDispatcher
 // =====================================================================
 class PlatformTaskDispatcher {
 public:
+    struct TaskPacket {
+        std::function<void()> fn;
+        uint64_t generation;
+    };
+
     static PlatformTaskDispatcher& Get() {
         static PlatformTaskDispatcher instance;
         return instance;
@@ -280,7 +328,6 @@ public:
         hwnd_ = CreateWindowEx(0, L"WFPluginDispatcher", nullptr, 0,
                                0, 0, 0, 0, HWND_MESSAGE, nullptr,
                                GetModuleHandle(nullptr), nullptr);
-
         currentGeneration_++;
     }
 
@@ -296,8 +343,8 @@ public:
 
         MSG msg;
         while (PeekMessage(&msg, hwndToDestroy, WM_APP + 1, WM_APP + 1, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+            auto* packet = reinterpret_cast<TaskPacket*>(msg.lParam);
+            delete packet;
         }
         DestroyWindow(hwndToDestroy);
     }
@@ -312,10 +359,6 @@ public:
         }
         if (!hwnd) return;
 
-        struct TaskPacket {
-            std::function<void()> fn;
-            uint64_t generation;
-        };
         auto* packet = new TaskPacket{ std::move(task), generation };
         if (!PostMessage(hwnd, WM_APP + 1, 0, reinterpret_cast<LPARAM>(packet))) {
             delete packet;
@@ -329,10 +372,6 @@ private:
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (msg == WM_APP + 1) {
-            struct TaskPacket {
-                std::function<void()> fn;
-                uint64_t generation;
-            };
             auto* packet = reinterpret_cast<TaskPacket*>(lParam);
             if (packet) {
                 uint64_t live = PlatformTaskDispatcher::Get().currentGeneration_.load();
@@ -346,7 +385,6 @@ private:
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 };
-
 
 // =====================================================================
 // Hook callbacks
@@ -362,7 +400,6 @@ LRESULT CALLBACK WindowFocusPlugin::KeyboardProc(int nCode, WPARAM wParam, LPARA
         if (inst && !inst->isShuttingDown_.load(std::memory_order_acquire)) {
             if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
                 KBDLLHOOKSTRUCT* pKeyboard = (KBDLLHOOKSTRUCT*)lParam;
-                // FIX: enableDebug_ is now std::atomic<bool>, safe to read from any thread.
                 if (inst->enableDebug_.load(std::memory_order_relaxed) && pKeyboard) {
                     std::cout << "[WindowFocus] Keyboard hook: key down vkCode="
                               << pKeyboard->vkCode << std::endl;
@@ -371,12 +408,13 @@ LRESULT CALLBACK WindowFocusPlugin::KeyboardProc(int nCode, WPARAM wParam, LPARA
                 inst->UpdateLastActivityTime();
 
                 auto now = std::chrono::steady_clock::now();
-                auto epoch = now.time_since_epoch();
-                inst->lastKeyEventTime_ = std::chrono::duration_cast<std::chrono::milliseconds>(epoch).count();
+                inst->lastKeyEventTime_.store(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now.time_since_epoch()).count(),
+                    std::memory_order_release);
 
-                if (!inst->userIsActive_.load(std::memory_order_relaxed)) {
-                    inst->userIsActive_.store(true, std::memory_order_relaxed);
-
+                if (!inst->userIsActive_.load(std::memory_order_acquire)) {
+                    inst->userIsActive_.store(true, std::memory_order_release);
                     std::weak_ptr<WindowFocusPlugin> weak = inst;
                     inst->PostToMainThread([weak]() {
                         if (auto p = weak.lock()) {
@@ -399,14 +437,12 @@ LRESULT CALLBACK WindowFocusPlugin::MouseProc(int nCode, WPARAM wParam, LPARAM l
         }
 
         if (inst && !inst->isShuttingDown_.load(std::memory_order_acquire)) {
-            // FIX: enableDebug_ is now std::atomic<bool>.
             if (inst->enableDebug_.load(std::memory_order_relaxed)) {
                 std::cout << "[WindowFocus] mouse hook detected action" << std::endl;
             }
             inst->UpdateLastActivityTime();
-            if (!inst->userIsActive_.load(std::memory_order_relaxed)) {
-                inst->userIsActive_.store(true, std::memory_order_relaxed);
-
+            if (!inst->userIsActive_.load(std::memory_order_acquire)) {
+                inst->userIsActive_.store(true, std::memory_order_release);
                 std::weak_ptr<WindowFocusPlugin> weak = inst;
                 inst->PostToMainThread([weak]() {
                     if (auto p = weak.lock()) {
@@ -420,7 +456,6 @@ LRESULT CALLBACK WindowFocusPlugin::MouseProc(int nCode, WPARAM wParam, LPARAM l
 }
 
 void WindowFocusPlugin::SetHooks() {
-    // FIX: enableDebug_ is now std::atomic<bool>.
     if (enableDebug_.load(std::memory_order_relaxed)) {
         std::cout << "[WindowFocus] SetHooks: start\n";
     }
@@ -439,6 +474,9 @@ void WindowFocusPlugin::SetHooks() {
     } else if (enableDebug_.load(std::memory_order_relaxed)) {
         std::cout << "[WindowFocus] Keyboard hook installed successfully\n";
     }
+
+    hooksInstalled_.store(mouseHook_ != nullptr && keyboardHook_ != nullptr,
+                          std::memory_order_release);
 }
 
 void WindowFocusPlugin::RemoveHooks() {
@@ -450,6 +488,7 @@ void WindowFocusPlugin::RemoveHooks() {
         UnhookWindowsHookEx(keyboardHook_);
         keyboardHook_ = nullptr;
     }
+    hooksInstalled_.store(false, std::memory_order_release);
 }
 
 void WindowFocusPlugin::UpdateLastActivityTime() {
@@ -495,33 +534,35 @@ void WindowFocusPlugin::SafeInvokeMethodWithMap(const std::string& methodName, f
     }
 }
 
-std::string ConvertWindows1251ToUTF8(const std::string& windows1251_str) {
-    if (windows1251_str.empty()) return std::string();
+std::string ConvertToUTF8(const std::string& input) {
+    if (input.empty()) return std::string();
 
-    int size_needed = MultiByteToWideChar(1251, 0, windows1251_str.c_str(), -1, NULL, 0);
-    if (size_needed <= 0) return std::string();
+    int wideSize = MultiByteToWideChar(CP_ACP, 0, input.c_str(), (int)input.size(), nullptr, 0);
+    if (wideSize <= 0) return std::string();
 
-    std::wstring utf16_str(size_needed, 0);
-    MultiByteToWideChar(1251, 0, windows1251_str.c_str(), -1, &utf16_str[0], size_needed);
+    std::wstring utf16_str(wideSize, 0);
+    MultiByteToWideChar(CP_ACP, 0, input.c_str(), (int)input.size(), &utf16_str[0], wideSize);
 
-    size_needed = WideCharToMultiByte(CP_UTF8, 0, utf16_str.c_str(), -1, NULL, 0, NULL, NULL);
-    if (size_needed <= 0) return std::string();
+    int utf8Size = WideCharToMultiByte(CP_UTF8, 0, utf16_str.c_str(), (int)utf16_str.size(),
+                                        nullptr, 0, nullptr, nullptr);
+    if (utf8Size <= 0) return std::string();
 
-    std::string utf8_str(size_needed, 0);
-    WideCharToMultiByte(CP_UTF8, 0, utf16_str.c_str(), -1, &utf8_str[0], size_needed, NULL, NULL);
+    std::string utf8_str(utf8Size, 0);
+    WideCharToMultiByte(CP_UTF8, 0, utf16_str.c_str(), (int)utf16_str.size(),
+                        &utf8_str[0], utf8Size, nullptr, nullptr);
 
     return utf8_str;
 }
 
 std::string ConvertWStringToUTF8(const std::wstring& wstr) {
-    if (wstr.empty()) {
-        return std::string();
-    }
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
+    if (wstr.empty()) return std::string();
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(),
+                                           nullptr, 0, nullptr, nullptr);
     if (size_needed <= 0) return std::string();
 
     std::string strTo(size_needed, 0);
-    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(),
+                        &strTo[0], size_needed, nullptr, nullptr);
     return strTo;
 }
 
@@ -570,14 +611,10 @@ void WindowFocusPlugin::RegisterWithRegistrar(
 
 std::string GetFocusedWindowTitle() {
     HWND hwnd = GetForegroundWindow();
-    if (hwnd == NULL) {
-        return "";
-    }
+    if (hwnd == NULL) return "";
 
     int length = GetWindowTextLength(hwnd);
-    if (length == 0) {
-        return "";
-    }
+    if (length == 0) return "";
 
     std::string buffer(length + 1, '\0');
     GetWindowTextA(hwnd, buffer.data(), length + 1);
@@ -587,17 +624,14 @@ std::string GetFocusedWindowTitle() {
 
 WindowFocusPlugin::WindowFocusPlugin()
     : isShuttingDown_(false)
-    , threadCount_(0)
     , userIsActive_(true)
-    // FIX: All monitoring flags and enableDebug_ are now std::atomic<bool>
-    // so they can be safely written from the main thread and read from
-    // background threads without a data race (which was UB and could crash).
     , monitorControllers_(false)
     , monitorAudio_(false)
     , monitorHIDDevices_(false)
     , monitorKeyboard_(true)
     , enableDebug_(false)
-    , inactivityThreshold_(300000)   // 5 minutes default
+    , hooksInstalled_(false)
+    , inactivityThreshold_(300000)
     , audioThreshold_(0.01f)
     , lastKeyEventTime_(0) {
 
@@ -607,6 +641,7 @@ WindowFocusPlugin::WindowFocusPlugin()
 }
 
 WindowFocusPlugin::~WindowFocusPlugin() {
+    // Signal shutdown first
     isShuttingDown_.store(true, std::memory_order_release);
 
     {
@@ -618,28 +653,26 @@ WindowFocusPlugin::~WindowFocusPlugin() {
 
     RemoveHooks();
 
-    // Signal all background threads to exit.
+    // Wake all threads so they can observe isShuttingDown_ and exit
     {
         std::lock_guard<std::mutex> lock(shutdownMutex_);
         shutdownCv_.notify_all();
     }
 
-    auto waitStart = std::chrono::steady_clock::now();
-    while (threadCount_.load() > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        auto elapsed = std::chrono::steady_clock::now() - waitStart;
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() > 5000) {
-            if (enableDebug_.load(std::memory_order_relaxed)) {
-                std::cerr << "[WindowFocus] Timeout waiting for threads. Remaining: "
-                          << threadCount_.load() << std::endl;
+    // Join all threads before destroying any state they may reference
+    {
+        std::lock_guard<std::mutex> lock(threadsMutex_);
+        for (auto& t : threads_) {
+            if (t.joinable()) {
+                t.join();
             }
-            break;
         }
+        threads_.clear();
     }
 
+    // Safe to close HID devices now — no threads are running
     CloseHIDDevices();
 
-    // Drain and shut down dispatcher AFTER background threads have exited.
     PlatformTaskDispatcher::Get().Shutdown();
 
     {
@@ -657,15 +690,12 @@ void WindowFocusPlugin::HandleMethodCall(
     if (method_name == "setDebugMode") {
         if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
             auto it = args->find(flutter::EncodableValue("debug"));
-            if (it != args->end()) {
-                if (std::holds_alternative<bool>(it->second)) {
-                    // FIX: atomic store — safe for background threads to read concurrently.
-                    bool newDebugValue = std::get<bool>(it->second);
-                    enableDebug_.store(newDebugValue, std::memory_order_relaxed);
-                    std::cout << "[WindowFocus] C++: enableDebug_ set to " << (newDebugValue ? "true" : "false") << std::endl;
-                    result->Success();
-                    return;
-                }
+            if (it != args->end() && std::holds_alternative<bool>(it->second)) {
+                bool val = std::get<bool>(it->second);
+                enableDebug_.store(val, std::memory_order_relaxed);
+                std::cout << "[WindowFocus] enableDebug_ set to " << (val ? "true" : "false") << std::endl;
+                result->Success();
+                return;
             }
         }
         result->Error("Invalid argument", "Expected a bool for 'debug'.");
@@ -675,14 +705,12 @@ void WindowFocusPlugin::HandleMethodCall(
     if (method_name == "setControllerMonitoring") {
         if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
             auto it = args->find(flutter::EncodableValue("enabled"));
-            if (it != args->end()) {
-                if (std::holds_alternative<bool>(it->second)) {
-                    // FIX: atomic store.
-                    monitorControllers_.store(std::get<bool>(it->second), std::memory_order_relaxed);
-                    std::cout << "[WindowFocus] Controller monitoring set to " << (monitorControllers_.load() ? "true" : "false") << std::endl;
-                    result->Success();
-                    return;
-                }
+            if (it != args->end() && std::holds_alternative<bool>(it->second)) {
+                monitorControllers_.store(std::get<bool>(it->second), std::memory_order_release);
+                std::cout << "[WindowFocus] Controller monitoring: "
+                          << (monitorControllers_.load(std::memory_order_relaxed) ? "on" : "off") << std::endl;
+                result->Success();
+                return;
             }
         }
         result->Error("Invalid argument", "Expected a bool for 'enabled'.");
@@ -692,14 +720,12 @@ void WindowFocusPlugin::HandleMethodCall(
     if (method_name == "setAudioMonitoring") {
         if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
             auto it = args->find(flutter::EncodableValue("enabled"));
-            if (it != args->end()) {
-                if (std::holds_alternative<bool>(it->second)) {
-                    // FIX: atomic store.
-                    monitorAudio_.store(std::get<bool>(it->second), std::memory_order_relaxed);
-                    std::cout << "[WindowFocus] Audio monitoring set to " << (monitorAudio_.load() ? "true" : "false") << std::endl;
-                    result->Success();
-                    return;
-                }
+            if (it != args->end() && std::holds_alternative<bool>(it->second)) {
+                monitorAudio_.store(std::get<bool>(it->second), std::memory_order_release);
+                std::cout << "[WindowFocus] Audio monitoring: "
+                          << (monitorAudio_.load(std::memory_order_relaxed) ? "on" : "off") << std::endl;
+                result->Success();
+                return;
             }
         }
         result->Error("Invalid argument", "Expected a bool for 'enabled'.");
@@ -709,14 +735,12 @@ void WindowFocusPlugin::HandleMethodCall(
     if (method_name == "setAudioThreshold") {
         if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
             auto it = args->find(flutter::EncodableValue("threshold"));
-            if (it != args->end()) {
-                if (std::holds_alternative<double>(it->second)) {
-                    // FIX: audioThreshold_ is now std::atomic<float>.
-                    audioThreshold_.store(static_cast<float>(std::get<double>(it->second)), std::memory_order_relaxed);
-                    std::cout << "[WindowFocus] Audio threshold set to " << audioThreshold_.load() << std::endl;
-                    result->Success();
-                    return;
-                }
+            if (it != args->end() && std::holds_alternative<double>(it->second)) {
+                audioThreshold_.store(static_cast<float>(std::get<double>(it->second)),
+                                      std::memory_order_release);
+                std::cout << "[WindowFocus] Audio threshold: " << audioThreshold_.load() << std::endl;
+                result->Success();
+                return;
             }
         }
         result->Error("Invalid argument", "Expected a double for 'threshold'.");
@@ -726,21 +750,17 @@ void WindowFocusPlugin::HandleMethodCall(
     if (method_name == "setHIDMonitoring") {
         if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
             auto it = args->find(flutter::EncodableValue("enabled"));
-            if (it != args->end()) {
-                if (std::holds_alternative<bool>(it->second)) {
-                    bool newValue = std::get<bool>(it->second);
-                    // FIX: atomic store before calling Init/Close so the
-                    // background thread sees the updated value immediately.
-                    bool oldValue = monitorHIDDevices_.exchange(newValue, std::memory_order_acq_rel);
-                    if (newValue && !oldValue) {
-                        InitializeHIDDevices();
-                    } else if (!newValue && oldValue) {
-                        CloseHIDDevices();
-                    }
-                    std::cout << "[WindowFocus] HID device monitoring set to " << (newValue ? "true" : "false") << std::endl;
-                    result->Success();
-                    return;
+            if (it != args->end() && std::holds_alternative<bool>(it->second)) {
+                bool newValue = std::get<bool>(it->second);
+                bool oldValue = monitorHIDDevices_.exchange(newValue, std::memory_order_acq_rel);
+                if (newValue && !oldValue) {
+                    InitializeHIDDevices();
+                } else if (!newValue && oldValue) {
+                    CloseHIDDevices();
                 }
+                std::cout << "[WindowFocus] HID monitoring: " << (newValue ? "on" : "off") << std::endl;
+                result->Success();
+                return;
             }
         }
         result->Error("Invalid argument", "Expected a bool for 'enabled'.");
@@ -750,27 +770,28 @@ void WindowFocusPlugin::HandleMethodCall(
     if (method_name == "setKeyboardMonitoring") {
         if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
             auto it = args->find(flutter::EncodableValue("enabled"));
-            if (it != args->end()) {
-                if (std::holds_alternative<bool>(it->second)) {
-                    bool newValue = std::get<bool>(it->second);
-                    // FIX: atomic store.
-                    bool oldValue = monitorKeyboard_.exchange(newValue, std::memory_order_acq_rel);
-                    std::cout << "[WindowFocus] Keyboard monitoring set to " << (newValue ? "true" : "false") << std::endl;
+            if (it != args->end() && std::holds_alternative<bool>(it->second)) {
+                bool newValue = std::get<bool>(it->second);
+                bool oldValue = monitorKeyboard_.exchange(newValue, std::memory_order_acq_rel);
+                std::cout << "[WindowFocus] Keyboard monitoring: " << (newValue ? "on" : "off") << std::endl;
 
-                    if (newValue && !oldValue && !keyboardHook_) {
-                        HINSTANCE hInstance = GetModuleHandle(nullptr);
-                        keyboardHook_ = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, hInstance, 0);
-                        if (!keyboardHook_) {
-                            std::cerr << "[WindowFocus] Failed to install keyboard hook: " << GetLastError() << std::endl;
-                        }
-                    } else if (!newValue && oldValue && keyboardHook_) {
-                        UnhookWindowsHookEx(keyboardHook_);
-                        keyboardHook_ = nullptr;
+                if (newValue && !oldValue && !keyboardHook_) {
+                    HINSTANCE hInstance = GetModuleHandle(nullptr);
+                    keyboardHook_ = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, hInstance, 0);
+                    if (!keyboardHook_) {
+                        std::cerr << "[WindowFocus] Failed to install keyboard hook: "
+                                  << GetLastError() << std::endl;
                     }
-
-                    result->Success();
-                    return;
+                    hooksInstalled_.store(keyboardHook_ != nullptr && mouseHook_ != nullptr,
+                                          std::memory_order_release);
+                } else if (!newValue && oldValue && keyboardHook_) {
+                    UnhookWindowsHookEx(keyboardHook_);
+                    keyboardHook_ = nullptr;
+                    hooksInstalled_.store(false, std::memory_order_release);
                 }
+
+                result->Success();
+                return;
             }
         }
         result->Error("Invalid argument", "Expected a bool for 'enabled'.");
@@ -780,21 +801,18 @@ void WindowFocusPlugin::HandleMethodCall(
     if (method_name == "setInactivityTimeOut") {
         if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
             auto it = args->find(flutter::EncodableValue("inactivityTimeOut"));
-            if (it != args->end()) {
-                if (std::holds_alternative<int>(it->second)) {
-                    // FIX: inactivityThreshold_ is now std::atomic<int>.
-                    inactivityThreshold_.store(std::get<int>(it->second), std::memory_order_relaxed);
-                    std::cout << "Updated inactivityThreshold_ to " << inactivityThreshold_.load() << std::endl;
-                    result->Success(flutter::EncodableValue(inactivityThreshold_.load()));
-                    return;
-                }
+            if (it != args->end() && std::holds_alternative<int>(it->second)) {
+                inactivityThreshold_.store(std::get<int>(it->second), std::memory_order_release);
+                std::cout << "Updated inactivityThreshold_ to " << inactivityThreshold_.load() << std::endl;
+                result->Success(flutter::EncodableValue(inactivityThreshold_.load()));
+                return;
             }
         }
         result->Error("Invalid argument", "Expected an integer argument.");
     } else if (method_name == "getPlatformVersion") {
         result->Success(flutter::EncodableValue("Windows: example"));
     } else if (method_name == "getIdleThreshold") {
-        result->Success(flutter::EncodableValue(inactivityThreshold_.load(std::memory_order_relaxed)));
+        result->Success(flutter::EncodableValue(inactivityThreshold_.load(std::memory_order_acquire)));
     } else if (method_name == "takeScreenshot") {
         bool activeWindowOnly = false;
         if (const auto* args = std::get_if<flutter::EncodableMap>(method_call.arguments())) {
@@ -842,19 +860,17 @@ std::string GetProcessName(DWORD processID) {
 
 std::string GetFocusedWindowAppName() {
     HWND hwnd = GetForegroundWindow();
-    if (hwnd == NULL) {
-        return "<no window in focus>";
-    }
+    if (hwnd == NULL) return "<no window in focus>";
 
-    DWORD processID;
+    DWORD processID = 0;
     GetWindowThreadProcessId(hwnd, &processID);
+    if (processID == 0) return "<unknown>";
 
     return GetProcessName(processID);
 }
 
 bool WindowFocusPlugin::CheckControllerInput() {
-    // FIX: atomic load — no race with main thread writing monitorControllers_.
-    if (!monitorControllers_.load(std::memory_order_relaxed) ||
+    if (!monitorControllers_.load(std::memory_order_acquire) ||
         isShuttingDown_.load(std::memory_order_acquire)) {
         return false;
     }
@@ -900,7 +916,7 @@ bool WindowFocusPlugin::CheckRawInput() {
         if (currentMousePos.x != lastMousePosition_.x || currentMousePos.y != lastMousePosition_.y) {
             lastMousePosition_ = currentMousePos;
             if (enableDebug_.load(std::memory_order_relaxed)) {
-                std::cout << "[WindowFocus] Mouse movement detected via cursor position" << std::endl;
+                std::cout << "[WindowFocus] Mouse movement detected" << std::endl;
             }
             return true;
         }
@@ -909,49 +925,38 @@ bool WindowFocusPlugin::CheckRawInput() {
     return false;
 }
 
-bool WindowFocusPlugin::CheckKeyboardInput() {
-    // FIX: atomic load.
-    if (!monitorKeyboard_.load(std::memory_order_relaxed) ||
-        isShuttingDown_.load(std::memory_order_acquire)) {
-        return false;
-    }
-
-    auto now = std::chrono::steady_clock::now();
-    auto epoch = now.time_since_epoch();
-    uint64_t currentTime = std::chrono::duration_cast<std::chrono::milliseconds>(epoch).count();
-    uint64_t lastKeyTime = lastKeyEventTime_.load();
-
-    if (lastKeyTime > 0 && (currentTime - lastKeyTime) < 200) {
-        return true;
-    }
+bool WindowFocusPlugin::PollKeyboardState() {
+    // NOTE: This is a fallback used only when hooks are not installed.
+    // GetAsyncKeyState can report keys consumed by other applications,
+    // and polling ~80+ keys each cycle is inherently expensive compared
+    // to the hook-based path.
+    if (isShuttingDown_.load(std::memory_order_acquire)) return false;
 
     bool exceptionOccurred = false;
 
+    // Letters A-Z
     for (int vk = 0x41; vk <= 0x5A; vk++) {
         if (isShuttingDown_.load(std::memory_order_acquire)) return false;
-        if (CheckKeyStateSEH(vk, &exceptionOccurred)) {
-            if (!exceptionOccurred) return true;
-        }
-        if (exceptionOccurred) break;
+        if (CheckKeyStateSEH(vk, &exceptionOccurred) && !exceptionOccurred) return true;
+        if (exceptionOccurred) return false;
     }
 
+    // Numbers 0-9
     for (int vk = 0x30; vk <= 0x39; vk++) {
         if (isShuttingDown_.load(std::memory_order_acquire)) return false;
-        if (CheckKeyStateSEH(vk, &exceptionOccurred)) {
-            if (!exceptionOccurred) return true;
-        }
-        if (exceptionOccurred) break;
+        if (CheckKeyStateSEH(vk, &exceptionOccurred) && !exceptionOccurred) return true;
+        if (exceptionOccurred) return false;
     }
 
+    // Function keys
     for (int vk = VK_F1; vk <= VK_F12; vk++) {
         if (isShuttingDown_.load(std::memory_order_acquire)) return false;
-        if (CheckKeyStateSEH(vk, &exceptionOccurred)) {
-            if (!exceptionOccurred) return true;
-        }
-        if (exceptionOccurred) break;
+        if (CheckKeyStateSEH(vk, &exceptionOccurred) && !exceptionOccurred) return true;
+        if (exceptionOccurred) return false;
     }
 
-    int specialKeys[] = {
+    // Special keys
+    static const int specialKeys[] = {
         VK_SPACE, VK_RETURN, VK_TAB, VK_ESCAPE, VK_BACK, VK_DELETE,
         VK_SHIFT, VK_CONTROL, VK_MENU,
         VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU,
@@ -967,32 +972,43 @@ bool WindowFocusPlugin::CheckKeyboardInput() {
         VK_LWIN, VK_RWIN, VK_APPS
     };
 
-    int numSpecialKeys = sizeof(specialKeys) / sizeof(specialKeys[0]);
-    for (int i = 0; i < numSpecialKeys; i++) {
+    for (int vk : specialKeys) {
         if (isShuttingDown_.load(std::memory_order_acquire)) return false;
-        if (CheckKeyStateSEH(specialKeys[i], &exceptionOccurred)) {
-            if (!exceptionOccurred) return true;
-        }
-        if (exceptionOccurred) break;
+        if (CheckKeyStateSEH(vk, &exceptionOccurred) && !exceptionOccurred) return true;
+        if (exceptionOccurred) return false;
     }
 
     return false;
 }
 
-bool WindowFocusPlugin::CheckSystemAudio() {
-    // FIX: atomic load.
-    if (!monitorAudio_.load(std::memory_order_relaxed) ||
+bool WindowFocusPlugin::CheckKeyboardInput() {
+    if (!monitorKeyboard_.load(std::memory_order_acquire) ||
         isShuttingDown_.load(std::memory_order_acquire)) {
         return false;
     }
 
-    // FIX: Remove thread_local ComGuard with destructor. Instead, initialise
-    // COM once at thread start (in MonitorAllInputDevices) and uninitialise it
-    // when that thread exits. This avoids a destructor running on a detached
-    // thread after the plugin has been torn down.
-    //
-    // The calling thread (MonitorAllInputDevices) now owns COM lifetime via
-    // the comInitialized flag passed in. Here we just call into the SEH helper.
+    // If hooks are active, check the hook timestamp — no need to poll
+    if (hooksInstalled_.load(std::memory_order_acquire)) {
+        auto now = std::chrono::steady_clock::now();
+        uint64_t currentTime = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+        uint64_t lastKeyTime = lastKeyEventTime_.load(std::memory_order_acquire);
+
+        if (lastKeyTime > 0 && (currentTime - lastKeyTime) < 200) {
+            return true;
+        }
+        return false;
+    }
+
+    // Hooks not installed — fall back to polling
+    return PollKeyboardState();
+}
+
+bool WindowFocusPlugin::CheckSystemAudio() {
+    if (!monitorAudio_.load(std::memory_order_acquire) ||
+        isShuttingDown_.load(std::memory_order_acquire)) {
+        return false;
+    }
 
     float peakValue = 0.0f;
     bool comError = false;
@@ -1002,8 +1018,7 @@ bool WindowFocusPlugin::CheckSystemAudio() {
         std::cerr << "[WindowFocus] Exception in CheckSystemAudio" << std::endl;
     }
 
-    // FIX: atomic load for audioThreshold_.
-    if (success && peakValue > audioThreshold_.load(std::memory_order_relaxed)) {
+    if (success && peakValue > audioThreshold_.load(std::memory_order_acquire)) {
         if (enableDebug_.load(std::memory_order_relaxed)) {
             std::cout << "[WindowFocus] Audio detected, peak: " << peakValue << std::endl;
         }
@@ -1032,8 +1047,7 @@ void WindowFocusPlugin::InitializeHIDDevices() {
 
     HDEVINFO deviceInfoSet = SetupDiGetClassDevs(
         &hidGuid, nullptr, nullptr,
-        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE
-    );
+        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
 
     if (deviceInfoSet == INVALID_HANDLE_VALUE) {
         if (enableDebug_.load(std::memory_order_relaxed)) {
@@ -1047,96 +1061,90 @@ void WindowFocusPlugin::InitializeHIDDevices() {
 
     DWORD memberIndex = 0;
     while (!isShuttingDown_.load(std::memory_order_acquire) && SetupDiEnumDeviceInterfaces(
-        deviceInfoSet, nullptr, &hidGuid, memberIndex++, &deviceInterfaceData
-    )) {
+        deviceInfoSet, nullptr, &hidGuid, memberIndex++, &deviceInterfaceData)) {
+
         DWORD requiredSize = 0;
         SetupDiGetDeviceInterfaceDetail(
             deviceInfoSet, &deviceInterfaceData,
-            nullptr, 0, &requiredSize, nullptr
-        );
+            nullptr, 0, &requiredSize, nullptr);
 
         if (requiredSize == 0) continue;
 
+        std::vector<BYTE> detailBuffer(requiredSize);
         PSP_DEVICE_INTERFACE_DETAIL_DATA detailData =
-            (PSP_DEVICE_INTERFACE_DETAIL_DATA)malloc(requiredSize);
-        if (!detailData) continue;
-
+            reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA>(detailBuffer.data());
         detailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
 
-        if (SetupDiGetDeviceInterfaceDetail(
+        if (!SetupDiGetDeviceInterfaceDetail(
             deviceInfoSet, &deviceInterfaceData,
-            detailData, requiredSize, nullptr, nullptr
-        )) {
-            HANDLE deviceHandle = CreateHIDDeviceHandleSEH(detailData->DevicePath);
-
-            if (deviceHandle != INVALID_HANDLE_VALUE) {
-                HIDD_ATTRIBUTES attributes;
-                attributes.Size = sizeof(HIDD_ATTRIBUTES);
-
-                if (GetHIDAttributesSEH(deviceHandle, &attributes)) {
-                    PHIDP_PREPARSED_DATA preparsedData = nullptr;
-
-                    if (GetHIDPreparsedDataSEH(deviceHandle, &preparsedData)) {
-                        HIDP_CAPS caps;
-                        ZeroMemory(&caps, sizeof(caps));
-
-                        if (GetHIDCapsSEH(preparsedData, &caps)) {
-                            bool isAudioDevice = (caps.UsagePage == 0x0B || caps.UsagePage == 0x0C);
-                            bool isKeyboard    = (caps.UsagePage == 0x01 && caps.Usage == 0x06);
-                            bool isMouse       = (caps.UsagePage == 0x01 && caps.Usage == 0x02);
-
-                            if (!isAudioDevice && !isKeyboard && !isMouse && caps.InputReportByteLength > 0) {
-                                hidDeviceHandles_.push_back(deviceHandle);
-                                lastHIDStates_.push_back(std::vector<BYTE>(caps.InputReportByteLength, 0));
-
-                                if (enableDebug_.load(std::memory_order_relaxed)) {
-                                    std::cout << "[WindowFocus] HID device added: VID="
-                                              << std::hex << attributes.VendorID
-                                              << " PID=" << attributes.ProductID
-                                              << std::dec << std::endl;
-                                }
-                            } else {
-                                CloseHandleSEH(deviceHandle);
-                            }
-                        } else {
-                            CloseHandleSEH(deviceHandle);
-                        }
-
-                        if (preparsedData) {
-                            __try { HidD_FreePreparsedData(preparsedData); }
-                            __except (EXCEPTION_EXECUTE_HANDLER) {}
-                        }
-                    } else {
-                        CloseHandleSEH(deviceHandle);
-                    }
-                } else {
-                    CloseHandleSEH(deviceHandle);
-                }
-            }
+            detailData, requiredSize, nullptr, nullptr)) {
+            continue;
         }
 
-        free(detailData);
+        HANDLE deviceHandle = CreateHIDDeviceHandleSEH(detailData->DevicePath);
+        if (deviceHandle == INVALID_HANDLE_VALUE) continue;
+
+        HIDD_ATTRIBUTES attributes;
+        attributes.Size = sizeof(HIDD_ATTRIBUTES);
+
+        if (!GetHIDAttributesSEH(deviceHandle, &attributes)) {
+            CloseHandleSEH(deviceHandle);
+            continue;
+        }
+
+        PHIDP_PREPARSED_DATA preparsedData = nullptr;
+        if (!GetHIDPreparsedDataSEH(deviceHandle, &preparsedData)) {
+            CloseHandleSEH(deviceHandle);
+            continue;
+        }
+
+        HIDP_CAPS caps;
+        ZeroMemory(&caps, sizeof(caps));
+        bool gotCaps = GetHIDCapsSEH(preparsedData, &caps);
+
+        FreePreparsedDataSEH(preparsedData);
+
+        if (!gotCaps) {
+            CloseHandleSEH(deviceHandle);
+            continue;
+        }
+
+        bool isAudioDevice = (caps.UsagePage == 0x0B || caps.UsagePage == 0x0C);
+        bool isKeyboard    = (caps.UsagePage == 0x01 && caps.Usage == 0x06);
+        bool isMouse       = (caps.UsagePage == 0x01 && caps.Usage == 0x02);
+
+        if (!isAudioDevice && !isKeyboard && !isMouse && caps.InputReportByteLength > 0) {
+            hidDeviceHandles_.push_back(deviceHandle);
+            lastHIDStates_.push_back(std::vector<BYTE>(caps.InputReportByteLength, 0));
+
+            if (enableDebug_.load(std::memory_order_relaxed)) {
+                std::cout << "[WindowFocus] HID device added: VID="
+                          << std::hex << attributes.VendorID
+                          << " PID=" << attributes.ProductID
+                          << std::dec << std::endl;
+            }
+        } else {
+            CloseHandleSEH(deviceHandle);
+        }
     }
 
     SetupDiDestroyDeviceInfoList(deviceInfoSet);
 
     if (enableDebug_.load(std::memory_order_relaxed)) {
-        std::cout << "[WindowFocus] Initialized " << hidDeviceHandles_.size() << " HID devices" << std::endl;
+        std::cout << "[WindowFocus] Initialized " << hidDeviceHandles_.size()
+                  << " HID devices" << std::endl;
     }
 }
 
 bool WindowFocusPlugin::CheckHIDDevices() {
-    // FIX: atomic load.
-    if (!monitorHIDDevices_.load(std::memory_order_relaxed) ||
+    if (!monitorHIDDevices_.load(std::memory_order_acquire) ||
         isShuttingDown_.load(std::memory_order_acquire)) {
         return false;
     }
 
     std::lock_guard<std::mutex> lock(hidDevicesMutex_);
 
-    if (hidDeviceHandles_.empty()) {
-        return false;
-    }
+    if (hidDeviceHandles_.empty()) return false;
 
     bool inputDetected = false;
     std::vector<size_t> invalidDevices;
@@ -1156,16 +1164,14 @@ bool WindowFocusPlugin::CheckHIDDevices() {
 
         std::vector<BYTE> buffer(lastState.size(), 0);
 
-        HANDLE hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-        if (hEvent == nullptr) {
+        OverlappedGuard ovlGuard(deviceHandle);
+        if (!ovlGuard.IsValid()) {
             if (enableDebug_.load(std::memory_order_relaxed)) {
-                std::cerr << "[WindowFocus] Failed to create event for HID device " << i << std::endl;
+                std::cerr << "[WindowFocus] Failed to create event for HID device "
+                          << i << std::endl;
             }
             continue;
         }
-
-        OVERLAPPED* pOvl = new OVERLAPPED{};
-        pOvl->hEvent = hEvent;
 
         DWORD bytesRead = 0;
         DWORD bufferSize = static_cast<DWORD>(buffer.size());
@@ -1173,78 +1179,73 @@ bool WindowFocusPlugin::CheckHIDDevices() {
 
         bool readSucceeded = ReadHIDDeviceSEH(
             deviceHandle, buffer.data(), bufferSize,
-            pOvl, &bytesRead, &errorCode);
-
-        auto cleanupOvl = [&]() {
-            CancelIoSEH(deviceHandle);
-            WaitForSingleObject(hEvent, 200);
-            delete pOvl;
-            CloseHandleSEH(hEvent);
-        };
+            ovlGuard.Get(), &bytesRead, &errorCode);
 
         if (readSucceeded) {
+            ovlGuard.MarkComplete();
             if (bytesRead > 0 && buffer != lastState) {
                 inputDetected = true;
                 lastState = buffer;
                 if (enableDebug_.load(std::memory_order_relaxed)) {
-                    std::cout << "[WindowFocus] HID device " << i << " input detected" << std::endl;
+                    std::cout << "[WindowFocus] HID device " << i
+                              << " input detected" << std::endl;
                 }
             }
-            delete pOvl;
-            CloseHandleSEH(hEvent);
         } else if (errorCode == ERROR_IO_PENDING) {
-            DWORD waitResult = WaitForSingleObject(hEvent, 10);
+            DWORD waitResult = WaitForSingleObject(ovlGuard.ovl.hEvent, 10);
             if (waitResult == WAIT_OBJECT_0) {
+                ovlGuard.MarkComplete();
                 DWORD overlappedError = 0;
-                if (GetOverlappedResultSEH(deviceHandle, pOvl, &bytesRead, &overlappedError)) {
+                if (GetOverlappedResultSEH(deviceHandle, ovlGuard.Get(),
+                                            &bytesRead, &overlappedError)) {
                     if (bytesRead > 0 && buffer != lastState) {
                         inputDetected = true;
                         lastState = buffer;
                         if (enableDebug_.load(std::memory_order_relaxed)) {
-                            std::cout << "[WindowFocus] HID device " << i << " input detected (overlapped)" << std::endl;
+                            std::cout << "[WindowFocus] HID device " << i
+                                      << " input (overlapped)" << std::endl;
                         }
                     }
                 } else if (overlappedError == ERROR_INVALID_HANDLE ||
                            overlappedError == ERROR_DEVICE_NOT_CONNECTED) {
                     invalidDevices.push_back(i);
                 }
-                delete pOvl;
-                CloseHandleSEH(hEvent);
-            } else {
-                cleanupOvl();
-                if (waitResult == WAIT_FAILED) {
-                    if (enableDebug_.load(std::memory_order_relaxed)) {
-                        std::cerr << "[WindowFocus] HID device " << i << " wait failed: " << GetLastError() << std::endl;
-                    }
-                    invalidDevices.push_back(i);
+            } else if (waitResult == WAIT_FAILED) {
+                if (enableDebug_.load(std::memory_order_relaxed)) {
+                    std::cerr << "[WindowFocus] HID device " << i
+                              << " wait failed: " << GetLastError() << std::endl;
                 }
+                invalidDevices.push_back(i);
             }
+            // WAIT_TIMEOUT: OverlappedGuard destructor handles CancelIo + wait
         } else if (errorCode == ERROR_DEVICE_NOT_CONNECTED ||
                    errorCode == ERROR_GEN_FAILURE ||
                    errorCode == ERROR_INVALID_HANDLE ||
                    errorCode == ERROR_BAD_DEVICE) {
+            ovlGuard.MarkComplete();
             if (enableDebug_.load(std::memory_order_relaxed)) {
-                std::cout << "[WindowFocus] HID device " << i << " disconnected (error: " << errorCode << ")" << std::endl;
+                std::cout << "[WindowFocus] HID device " << i
+                          << " disconnected (error: " << errorCode << ")" << std::endl;
             }
             invalidDevices.push_back(i);
-            delete pOvl;
-            CloseHandleSEH(hEvent);
         } else {
+            ovlGuard.MarkComplete();
             if (enableDebug_.load(std::memory_order_relaxed)) {
                 std::cerr << "[WindowFocus] Error reading HID device " << i
-                          << " (code: 0x" << std::hex << errorCode << std::dec << ")" << std::endl;
+                          << " (code: 0x" << std::hex << errorCode << std::dec
+                          << ")" << std::endl;
             }
             invalidDevices.push_back(i);
-            delete pOvl;
-            CloseHandleSEH(hEvent);
         }
 
         if (inputDetected) break;
     }
 
+    // Remove invalid devices in reverse order
     if (!invalidDevices.empty()) {
         std::sort(invalidDevices.begin(), invalidDevices.end());
-        invalidDevices.erase(std::unique(invalidDevices.begin(), invalidDevices.end()), invalidDevices.end());
+        invalidDevices.erase(std::unique(invalidDevices.begin(), invalidDevices.end()),
+                             invalidDevices.end());
 
         for (auto it = invalidDevices.rbegin(); it != invalidDevices.rend(); ++it) {
             size_t idx = *it;
@@ -1258,7 +1259,8 @@ bool WindowFocusPlugin::CheckHIDDevices() {
                 lastHIDStates_.erase(lastHIDStates_.begin() + idx);
 
                 if (enableDebug_.load(std::memory_order_relaxed)) {
-                    std::cout << "[WindowFocus] Removed invalid HID device at index " << idx << std::endl;
+                    std::cout << "[WindowFocus] Removed invalid HID device at index "
+                              << idx << std::endl;
                 }
             }
         }
@@ -1285,18 +1287,16 @@ void WindowFocusPlugin::CloseHIDDevices() {
 }
 
 void WindowFocusPlugin::MonitorAllInputDevices() {
-    if (monitorHIDDevices_.load(std::memory_order_relaxed)) {
+    if (monitorHIDDevices_.load(std::memory_order_acquire)) {
         InitializeHIDDevices();
     }
 
-    threadCount_++;
-    std::weak_ptr<WindowFocusPlugin> weakSelf = shared_from_this();
+    // Capture weak_ptr so the thread never prevents destruction
+    std::weak_ptr<WindowFocusPlugin> weak = shared_from_this();
 
-    std::thread([weakSelf]() {
-        // FIX: Initialise COM once for this thread's lifetime here, rather
-        // than using a thread_local ComGuard inside CheckSystemAudio.
-        // This ensures CoUninitialize() is called cleanly when this thread
-        // exits, not from a destructor that may fire after plugin teardown.
+    std::lock_guard<std::mutex> tlock(threadsMutex_);
+    threads_.emplace_back([weak]() {
+        // COM initialization owned by this thread
         bool comInitialized = false;
         {
             HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -1307,28 +1307,43 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
         const auto hidReinitInterval = std::chrono::seconds(30);
 
         while (true) {
-            // FIX: Acquire strong ref once per iteration and keep it for the
-            // entire iteration body. Do not drop and re-acquire mid-iteration.
-            // This eliminates the window where the object is partially destroyed
-            // while the thread is still executing.
-            auto self = weakSelf.lock();
+            auto self = weak.lock();
+            if (!self || self->isShuttingDown_.load(std::memory_order_acquire)) break;
+
+            {
+                std::unique_lock<std::mutex> lock(self->shutdownMutex_);
+                if (self->shutdownCv_.wait_for(lock, std::chrono::milliseconds(100),
+                    [&self] { return self->isShuttingDown_.load(std::memory_order_acquire); })) {
+                    break;
+                }
+            }
+
+            // Re-check after waking
+            self = weak.lock();
             if (!self || self->isShuttingDown_.load(std::memory_order_acquire)) break;
 
             bool inputDetected = false;
 
             try {
-                if (!self->isShuttingDown_.load() && self->CheckKeyboardInput())   inputDetected = true;
-                if (!self->isShuttingDown_.load() && self->CheckControllerInput()) inputDetected = true;
-                if (!self->isShuttingDown_.load() && self->CheckRawInput())        inputDetected = true;
-                if (!self->isShuttingDown_.load() && self->CheckSystemAudio())     inputDetected = true;
-                if (!self->isShuttingDown_.load() && self->CheckHIDDevices())      inputDetected = true;
+                if (!self->isShuttingDown_.load(std::memory_order_acquire) &&
+                    self->CheckKeyboardInput())   inputDetected = true;
+                if (!self->isShuttingDown_.load(std::memory_order_acquire) &&
+                    self->CheckControllerInput()) inputDetected = true;
+                if (!self->isShuttingDown_.load(std::memory_order_acquire) &&
+                    self->CheckRawInput())        inputDetected = true;
+                if (!self->isShuttingDown_.load(std::memory_order_acquire) &&
+                    self->CheckSystemAudio())     inputDetected = true;
+                if (!self->isShuttingDown_.load(std::memory_order_acquire) &&
+                    self->CheckHIDDevices())      inputDetected = true;
             } catch (...) {
                 if (self->enableDebug_.load(std::memory_order_relaxed)) {
-                    std::cerr << "[WindowFocus] Exception in MonitorAllInputDevices loop" << std::endl;
+                    std::cerr << "[WindowFocus] Exception in MonitorAllInputDevices loop"
+                              << std::endl;
                 }
             }
 
-            if (self->monitorHIDDevices_.load(std::memory_order_relaxed) &&
+            // Periodic HID re-initialization
+            if (self->monitorHIDDevices_.load(std::memory_order_acquire) &&
                 !self->isShuttingDown_.load(std::memory_order_acquire)) {
                 auto now = std::chrono::steady_clock::now();
                 if (now - lastHIDReinit > hidReinitInterval) {
@@ -1350,31 +1365,15 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
             if (inputDetected && !self->isShuttingDown_.load(std::memory_order_acquire)) {
                 self->UpdateLastActivityTime();
 
-                if (!self->userIsActive_.load(std::memory_order_relaxed)) {
-                    self->userIsActive_.store(true, std::memory_order_relaxed);
-                    std::weak_ptr<WindowFocusPlugin> weak = self;
+                if (!self->userIsActive_.load(std::memory_order_acquire)) {
+                    self->userIsActive_.store(true, std::memory_order_release);
                     self->PostToMainThread([weak]() {
                         if (auto p = weak.lock()) {
-                            p->SafeInvokeMethod("onUserActive", "User is active");
+                            if (!p->isShuttingDown_.load(std::memory_order_acquire)) {
+                                p->SafeInvokeMethod("onUserActive", "User is active");
+                            }
                         }
                     });
-                }
-            }
-
-            // FIX: Release the strong reference BEFORE sleeping so the
-            // destructor's threadCount_ wait is not blocked for 100ms.
-            self.reset();
-
-            // Now sleep — if shutdown fires during the sleep, the cv wakes us.
-            {
-                auto s = weakSelf.lock();
-                if (!s) break;
-                std::unique_lock<std::mutex> lock(s->shutdownMutex_);
-                // FIX: Hold s (strong ref) for the entire wait so the object
-                // cannot be destroyed while we're waiting on its cv.
-                if (s->shutdownCv_.wait_for(lock, std::chrono::milliseconds(100),
-                    [&s] { return s->isShuttingDown_.load(std::memory_order_acquire); })) {
-                    break;
                 }
             }
         }
@@ -1382,21 +1381,27 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
         if (comInitialized) {
             CoUninitialize();
         }
-
-        if (auto self = weakSelf.lock()) {
-            self->threadCount_--;
-        }
-    }).detach();
+    });
 }
 
 void WindowFocusPlugin::CheckForInactivity() {
-    threadCount_++;
-    std::weak_ptr<WindowFocusPlugin> weakSelf = shared_from_this();
+    std::weak_ptr<WindowFocusPlugin> weak = shared_from_this();
 
-    std::thread([weakSelf]() {
+    std::lock_guard<std::mutex> tlock(threadsMutex_);
+    threads_.emplace_back([weak]() {
         while (true) {
-            // FIX: Acquire once, keep for full iteration body.
-            auto self = weakSelf.lock();
+            auto self = weak.lock();
+            if (!self || self->isShuttingDown_.load(std::memory_order_acquire)) break;
+
+            {
+                std::unique_lock<std::mutex> lock(self->shutdownMutex_);
+                if (self->shutdownCv_.wait_for(lock, std::chrono::seconds(1),
+                    [&self] { return self->isShuttingDown_.load(std::memory_order_acquire); })) {
+                    break;
+                }
+            }
+
+            self = weak.lock();
             if (!self || self->isShuttingDown_.load(std::memory_order_acquire)) break;
 
             auto now = std::chrono::steady_clock::now();
@@ -1408,55 +1413,35 @@ void WindowFocusPlugin::CheckForInactivity() {
                     now - self->lastActivityTime).count();
             }
 
-            // FIX: atomic load for inactivityThreshold_.
-            if (duration > self->inactivityThreshold_.load(std::memory_order_relaxed) &&
-                self->userIsActive_.load(std::memory_order_relaxed)) {
-                self->userIsActive_.store(false, std::memory_order_relaxed);
+            if (duration > self->inactivityThreshold_.load(std::memory_order_acquire) &&
+                self->userIsActive_.load(std::memory_order_acquire)) {
+                self->userIsActive_.store(false, std::memory_order_release);
                 if (self->enableDebug_.load(std::memory_order_relaxed)) {
                     std::cout << "[WindowFocus] User inactive. Duration: " << duration
-                              << "ms, Threshold: " << self->inactivityThreshold_.load() << "ms" << std::endl;
+                              << "ms, Threshold: " << self->inactivityThreshold_.load()
+                              << "ms" << std::endl;
                 }
-                std::weak_ptr<WindowFocusPlugin> weak = self;
                 self->PostToMainThread([weak]() {
                     if (auto p = weak.lock()) {
-                        p->SafeInvokeMethod("onUserInactivity", "User is inactive");
+                        if (!p->isShuttingDown_.load(std::memory_order_acquire)) {
+                            p->SafeInvokeMethod("onUserInactivity", "User is inactive");
+                        }
                     }
                 });
             }
-
-            // Release strong ref before waiting.
-            self.reset();
-
-            {
-                auto s = weakSelf.lock();
-                if (!s) break;
-                std::unique_lock<std::mutex> lock(s->shutdownMutex_);
-                if (s->shutdownCv_.wait_for(lock, std::chrono::seconds(1),
-                    [&s] { return s->isShuttingDown_.load(std::memory_order_acquire); })) {
-                    break;
-                }
-            }
         }
-
-        if (auto self = weakSelf.lock()) {
-            self->threadCount_--;
-        }
-    }).detach();
+    });
 }
 
 void WindowFocusPlugin::StartFocusListener() {
-    threadCount_++;
-    std::weak_ptr<WindowFocusPlugin> weakSelf = shared_from_this();
+    std::weak_ptr<WindowFocusPlugin> weak = shared_from_this();
 
-    std::thread([weakSelf]() {
+    std::lock_guard<std::mutex> tlock(threadsMutex_);
+    threads_.emplace_back([weak]() {
         HWND last_focused = nullptr;
 
         while (true) {
-            // FIX: Acquire once and hold for full iteration including the
-            // sleep/wait. This eliminates the original TOCTOU race where self
-            // was reset mid-loop before the wait, so the destructor's
-            // notify_all() could fire before this thread ever called wait_for.
-            auto self = weakSelf.lock();
+            auto self = weak.lock();
             if (!self || self->isShuttingDown_.load(std::memory_order_acquire)) break;
 
             try {
@@ -1466,12 +1451,11 @@ void WindowFocusPlugin::StartFocusListener() {
 
                     if (current_focused != nullptr) {
                         int titleLen = GetWindowTextLengthA(current_focused);
-                        std::string window_title(titleLen > 0 ? titleLen + 1 : 1, '\0');
+                        std::string window_title;
                         if (titleLen > 0) {
+                            window_title.resize(titleLen + 1, '\0');
                             GetWindowTextA(current_focused, window_title.data(), titleLen + 1);
-                            window_title.resize(titleLen);
-                        } else {
-                            window_title.clear();
+                                                        window_title.resize(titleLen);
                         }
 
                         std::string appName = GetFocusedWindowAppName();
@@ -1483,8 +1467,8 @@ void WindowFocusPlugin::StartFocusListener() {
                             std::cout << "Current window appName: " << appName << std::endl;
                         }
 
-                        std::string utf8_output = ConvertWindows1251ToUTF8(window_title);
-                        std::string utf8_windowTitle = ConvertWindows1251ToUTF8(windowTitle);
+                        std::string utf8_output = ConvertToUTF8(window_title);
+                        std::string utf8_windowTitle = ConvertToUTF8(windowTitle);
 
                         flutter::EncodableMap data;
                         data[flutter::EncodableValue("title")]       = flutter::EncodableValue(utf8_output);
@@ -1492,44 +1476,40 @@ void WindowFocusPlugin::StartFocusListener() {
                         data[flutter::EncodableValue("windowTitle")] = flutter::EncodableValue(utf8_windowTitle);
 
                         if (!self->isShuttingDown_.load(std::memory_order_acquire)) {
-                            std::weak_ptr<WindowFocusPlugin> weak = self;
                             self->PostToMainThread([weak, d = std::move(data)]() mutable {
                                 if (auto p = weak.lock()) {
-                                    p->SafeInvokeMethodWithMap("onFocusChange", std::move(d));
+                                    if (!p->isShuttingDown_.load(std::memory_order_acquire)) {
+                                        p->SafeInvokeMethodWithMap("onFocusChange", std::move(d));
+                                    }
                                 }
                             });
                         }
                     }
                 }
             } catch (...) {
-                if (self->enableDebug_.load(std::memory_order_relaxed)) {
+                auto self2 = weak.lock();
+                if (self2 && self2->enableDebug_.load(std::memory_order_relaxed)) {
                     std::cerr << "[WindowFocus] Exception in StartFocusListener loop" << std::endl;
                 }
             }
 
-            // FIX: Wait while still holding self (strong ref), so the object
-            // cannot be destroyed mid-wait and notify_all() cannot be missed.
+            // Re-lock to check shutdown and sleep
             {
-                std::unique_lock<std::mutex> lock(self->shutdownMutex_);
-                if (self->shutdownCv_.wait_for(lock, std::chrono::milliseconds(100),
-                    [&self] { return self->isShuttingDown_.load(std::memory_order_acquire); })) {
+                auto self2 = weak.lock();
+                if (!self2 || self2->isShuttingDown_.load(std::memory_order_acquire)) break;
+
+                std::unique_lock<std::mutex> lock(self2->shutdownMutex_);
+                if (self2->shutdownCv_.wait_for(lock, std::chrono::milliseconds(100),
+                    [&self2] { return self2->isShuttingDown_.load(std::memory_order_acquire); })) {
                     break;
                 }
             }
-
-            // Release after wait completes, just before the next iteration
-            // re-acquires. This keeps the destructor wait short.
-            self.reset();
         }
-
-        if (auto self = weakSelf.lock()) {
-            self->threadCount_--;
-        }
-    }).detach();
+    });
 }
 
 // =====================================================================
-// GDI+ lifetime singleton — initialised once per process.
+// GDI+ singleton
 // =====================================================================
 class GdiplusLifetime {
 public:
@@ -1538,10 +1518,8 @@ public:
         return inst;
     }
     bool IsValid() const { return token_ != 0; }
-
 private:
     ULONG_PTR token_ = 0;
-
     GdiplusLifetime() {
         Gdiplus::GdiplusStartupInput input;
         Gdiplus::GdiplusStartup(&token_, &input, nullptr);
@@ -1554,58 +1532,46 @@ private:
 std::optional<std::vector<uint8_t>> WindowFocusPlugin::TakeScreenshot(bool activeWindowOnly) {
     std::lock_guard<std::mutex> lock(screenshotMutex_);
 
-    if (!GdiplusLifetime::Get().IsValid()) {
-        return std::nullopt;
-    }
+    if (!GdiplusLifetime::Get().IsValid()) return std::nullopt;
 
     HWND hwnd = activeWindowOnly ? GetForegroundWindow() : GetDesktopWindow();
     if (hwnd == NULL) hwnd = GetDesktopWindow();
 
     HDC hdcScreen = GetDC(NULL);
-    HDC hdcWindow = GetDC(hwnd);
-    HDC hdcMemDC  = CreateCompatibleDC(hdcWindow);
+    if (!hdcScreen) return std::nullopt;
+    ReleaseDCGuard screenDcGuard(NULL, hdcScreen);
 
-    if (!hdcScreen || !hdcWindow || !hdcMemDC) {
-        if (hdcMemDC) DeleteDC(hdcMemDC);
-        if (hdcWindow) ReleaseDC(hwnd, hdcWindow);
-        if (hdcScreen) ReleaseDC(NULL, hdcScreen);
-        return std::nullopt;
-    }
+    HDC hdcWindow = GetDC(hwnd);
+    if (!hdcWindow) return std::nullopt;
+    ReleaseDCGuard windowDcGuard(hwnd, hdcWindow);
+
+    HDC hdcMemDC = CreateCompatibleDC(hdcWindow);
+    if (!hdcMemDC) return std::nullopt;
+    DeleteDCGuard memDcGuard(hdcMemDC);
 
     RECT rc;
     GetWindowRect(hwnd, &rc);
     int width  = rc.right  - rc.left;
     int height = rc.bottom - rc.top;
 
-    if (width <= 0 || height <= 0) {
-        DeleteDC(hdcMemDC);
-        ReleaseDC(hwnd, hdcWindow);
-        ReleaseDC(NULL, hdcScreen);
-        return std::nullopt;
-    }
+    if (width <= 0 || height <= 0) return std::nullopt;
 
     HBITMAP hbmScreen = CreateCompatibleBitmap(hdcWindow, width, height);
-    if (!hbmScreen) {
-        DeleteDC(hdcMemDC);
-        ReleaseDC(hwnd, hdcWindow);
-        ReleaseDC(NULL, hdcScreen);
-        return std::nullopt;
-    }
+    if (!hbmScreen) return std::nullopt;
+    DeleteObjectGuard bitmapGuard(hbmScreen);
 
     HGDIOBJ oldBitmap = SelectObject(hdcMemDC, hbmScreen);
     BitBlt(hdcMemDC, 0, 0, width, height, hdcScreen, rc.left, rc.top, SRCCOPY);
+    SelectObject(hdcMemDC, oldBitmap);
 
     Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(hbmScreen, NULL);
-    IStream* stream = NULL;
+    if (!bitmap) return std::nullopt;
+
+    IStream* stream = nullptr;
     HRESULT hr = CreateStreamOnHGlobal(NULL, TRUE, &stream);
 
     if (FAILED(hr) || !stream) {
         delete bitmap;
-        SelectObject(hdcMemDC, oldBitmap);
-        DeleteObject(hbmScreen);
-        DeleteDC(hdcMemDC);
-        ReleaseDC(hwnd, hdcWindow);
-        ReleaseDC(NULL, hdcScreen);
         return std::nullopt;
     }
 
@@ -1625,11 +1591,6 @@ std::optional<std::vector<uint8_t>> WindowFocusPlugin::TakeScreenshot(bool activ
 
     stream->Release();
     delete bitmap;
-    SelectObject(hdcMemDC, oldBitmap);
-    DeleteObject(hbmScreen);
-    DeleteDC(hdcMemDC);
-    ReleaseDC(hwnd, hdcWindow);
-    ReleaseDC(NULL, hdcScreen);
 
     if (bytesRead > 0) {
         return data;
@@ -1642,17 +1603,18 @@ int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
     UINT size = 0;
     Gdiplus::GetImageEncodersSize(&num, &size);
     if (size == 0) return -1;
-    Gdiplus::ImageCodecInfo* pImageCodecInfo = (Gdiplus::ImageCodecInfo*)(malloc(size));
-    if (pImageCodecInfo == NULL) return -1;
+
+    std::vector<BYTE> codecBuffer(size);
+    Gdiplus::ImageCodecInfo* pImageCodecInfo =
+        reinterpret_cast<Gdiplus::ImageCodecInfo*>(codecBuffer.data());
+
     Gdiplus::GetImageEncoders(num, size, pImageCodecInfo);
     for (UINT j = 0; j < num; ++j) {
         if (wcscmp(pImageCodecInfo[j].MimeType, format) == 0) {
             *pClsid = pImageCodecInfo[j].Clsid;
-            free(pImageCodecInfo);
             return j;
         }
     }
-    free(pImageCodecInfo);
     return -1;
 }
 
