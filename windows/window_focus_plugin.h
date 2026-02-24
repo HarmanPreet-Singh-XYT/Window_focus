@@ -23,6 +23,10 @@
 
 namespace window_focus {
 
+// Forward declaration — defined in .cpp
+class AudioMeterCache;
+class PlatformTaskDispatcher;
+
 class WindowFocusPlugin : public std::enable_shared_from_this<WindowFocusPlugin> {
 public:
     static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar);
@@ -36,7 +40,19 @@ public:
     WindowFocusPlugin(WindowFocusPlugin&&) = delete;
     WindowFocusPlugin& operator=(WindowFocusPlugin&&) = delete;
 
+    // ---- Public API used by PlatformTaskDispatcher for power resume ----
+    bool IsShuttingDown() const;
+    void OnSystemResume();
+
+    // ---- Singleton instance (weak so destructor isn't blocked) ----
+    // Public so PlatformTaskDispatcher WndProc can access them
+    static std::weak_ptr<WindowFocusPlugin> instance_;
+    static std::mutex instanceMutex_;
+
 private:
+    // Allow PlatformTaskDispatcher to access private members for power events
+    friend class PlatformTaskDispatcher;
+
     // ---- Method channel ----
     void HandleMethodCall(
         const flutter::MethodCall<flutter::EncodableValue>& method_call,
@@ -49,10 +65,6 @@ private:
     void SafeInvokeMethod(const std::string& methodName, const std::string& message);
     void SafeInvokeMethodWithMap(const std::string& methodName, flutter::EncodableMap data);
     void PostToMainThread(std::function<void()> task);
-
-    // ---- Singleton instance (weak so destructor isn't blocked) ----
-    static std::weak_ptr<WindowFocusPlugin> instance_;
-    static std::mutex instanceMutex_;
 
     // ---- Hooks ----
     static HHOOK mouseHook_;
@@ -104,6 +116,14 @@ private:
     std::atomic<bool> monitorAudio_{false};
     std::atomic<float> audioThreshold_{0.01f};
 
+    // FIX: Cached audio meter — pointer owned by monitor thread,
+    //      accessed under audioMeterMutex_
+    std::mutex audioMeterMutex_;
+    AudioMeterCache* audioMeterCache_ = nullptr;  // Non-owning; monitor thread owns the object
+
+    // FIX: Signal from power resume to invalidate audio cache
+    std::atomic<bool> needsAudioCacheReset_{false};
+
     // ---- HID devices ----
     void InitializeHIDDevices();
     bool CheckHIDDevices();
@@ -112,6 +132,9 @@ private:
     std::vector<std::vector<BYTE>> lastHIDStates_;
     std::mutex hidDevicesMutex_;
     std::atomic<bool> monitorHIDDevices_{false};
+
+    // FIX: Signal from power resume to reinitialize HID devices
+    std::atomic<bool> needsHIDReinit_{false};
 
     // ---- Screenshot ----
     std::optional<std::vector<uint8_t>> TakeScreenshot(bool activeWindowOnly);

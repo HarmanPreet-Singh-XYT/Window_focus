@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <VersionHelpers.h>
+#include <PowrProf.h>
 
 #include <flutter/method_channel.h>
 #include <flutter/plugin_registrar_windows.h>
@@ -129,42 +130,16 @@ static bool FreePreparsedDataSEH(PHIDP_PREPARSED_DATA preparsedData) {
     }
 }
 
-static bool GetAudioPeakValueSEH(float* peakValue, bool* comErrorOut) {
-    IMMDeviceEnumerator* deviceEnumerator = nullptr;
-    IMMDevice* defaultDevice = nullptr;
-    IAudioMeterInformation* meterInfo = nullptr;
-    bool success = false;
-
+// FIX: SEH wrapper for audio peak - only does GetPeakValue on a pre-existing meter
+static bool GetPeakFromMeterSEH(IAudioMeterInformation* meter, float* peakValue) {
     *peakValue = 0.0f;
-    *comErrorOut = false;
-
     __try {
-        HRESULT hr = CoCreateInstance(
-            __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-            __uuidof(IMMDeviceEnumerator), (void**)&deviceEnumerator);
-
-        if (SUCCEEDED(hr) && deviceEnumerator) {
-            hr = deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &defaultDevice);
-        }
-        if (SUCCEEDED(hr) && defaultDevice) {
-            hr = defaultDevice->Activate(__uuidof(IAudioMeterInformation),
-                CLSCTX_ALL, nullptr, (void**)&meterInfo);
-        }
-        if (SUCCEEDED(hr) && meterInfo) {
-            hr = meterInfo->GetPeakValue(peakValue);
-            success = SUCCEEDED(hr);
-        }
+        HRESULT hr = meter->GetPeakValue(peakValue);
+        return SUCCEEDED(hr);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        success = false;
-        *comErrorOut = true;
+        return false;
     }
-
-    __try { if (meterInfo) meterInfo->Release(); } __except(EXCEPTION_EXECUTE_HANDLER) {}
-    __try { if (defaultDevice) defaultDevice->Release(); } __except(EXCEPTION_EXECUTE_HANDLER) {}
-    __try { if (deviceEnumerator) deviceEnumerator->Release(); } __except(EXCEPTION_EXECUTE_HANDLER) {}
-
-    return success;
 }
 
 static DWORD XInputGetStateSEH(DWORD dwUserIndex, XINPUT_STATE* pState, bool* exceptionOccurred) {
@@ -232,8 +207,6 @@ static bool CheckKeyStateSEH(int vKey, bool* exceptionOccurred) {
 
 // =====================================================================
 // RAII helper for overlapped HID reads
-// FIX: Bounded timeout instead of INFINITE
-// FIX: Validates handle before CancelIo
 // =====================================================================
 struct OverlappedGuard {
     OVERLAPPED ovl{};
@@ -249,13 +222,12 @@ struct OverlappedGuard {
     }
 
     ~OverlappedGuard() {
-        // FIX: Check handle validity before CancelIo to avoid operating on closed handles
         if (!completed && deviceHandle != INVALID_HANDLE_VALUE && IsHandleValid(deviceHandle)) {
             CancelIoSEH(deviceHandle);
         }
         if (hEvent) {
             if (!completed) {
-                // FIX: Bounded wait instead of INFINITE to prevent hangs
+                // FIX: Bounded wait to prevent hangs on stale/invalid handles
                 WaitForSingleObject(hEvent, 3000);
             }
             CloseHandleSEH(hEvent);
@@ -265,8 +237,6 @@ struct OverlappedGuard {
     bool IsValid() const { return hEvent != nullptr; }
     void MarkComplete() { completed = true; }
     OVERLAPPED* Get() { return &ovl; }
-
-    // FIX: Invalidate the device handle so destructor won't CancelIo on a closed handle
     void InvalidateDevice() { deviceHandle = INVALID_HANDLE_VALUE; }
 
     OverlappedGuard(const OverlappedGuard&) = delete;
@@ -302,7 +272,105 @@ struct DeleteObjectGuard {
 };
 
 // =====================================================================
+// FIX: Cached audio meter for long-running efficiency
+// Avoids creating/destroying 3 COM objects every 100ms
+// =====================================================================
+class AudioMeterCache {
+public:
+    AudioMeterCache() = default;
+    ~AudioMeterCache() { Reset(); }
+
+    // Returns peak audio value using cached COM objects.
+    // Recreates them on failure or every refreshInterval.
+    float GetPeak(bool enableDebug) {
+        auto now = std::chrono::steady_clock::now();
+
+        // Recreate if stale, failed too many times, or not yet initialized
+        bool needsRefresh = !meter_ ||
+            consecutiveFailures_ > 3 ||
+            (now - lastInitTime_) > refreshInterval_;
+
+        if (needsRefresh) {
+            Reset();
+            if (!Init(enableDebug)) {
+                return 0.0f;
+            }
+        }
+
+        float peak = 0.0f;
+        bool ok = GetPeakFromMeterSEH(meter_, &peak);
+
+        if (!ok) {
+            consecutiveFailures_++;
+            if (enableDebug) {
+                std::cerr << "[WindowFocus] AudioMeterCache: GetPeakValue failed ("
+                          << consecutiveFailures_ << " consecutive)" << std::endl;
+            }
+            return 0.0f;
+        }
+
+        consecutiveFailures_ = 0;
+        return peak;
+    }
+
+    // Force re-creation on next call (e.g., after system resume)
+    void Invalidate() {
+        Reset();
+    }
+
+private:
+    IAudioMeterInformation* meter_ = nullptr;
+    IMMDevice* device_ = nullptr;
+    IMMDeviceEnumerator* enumerator_ = nullptr;
+    int consecutiveFailures_ = 0;
+    std::chrono::steady_clock::time_point lastInitTime_{};
+    static constexpr auto refreshInterval_ = std::chrono::seconds(60);
+
+    bool Init(bool enableDebug) {
+        HRESULT hr = CoCreateInstance(
+            __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+            __uuidof(IMMDeviceEnumerator), (void**)&enumerator_);
+        if (FAILED(hr) || !enumerator_) {
+            if (enableDebug) std::cerr << "[WindowFocus] AudioMeterCache: Failed to create enumerator" << std::endl;
+            Reset();
+            return false;
+        }
+
+        hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, &device_);
+        if (FAILED(hr) || !device_) {
+            if (enableDebug) std::cerr << "[WindowFocus] AudioMeterCache: Failed to get default endpoint" << std::endl;
+            Reset();
+            return false;
+        }
+
+        hr = device_->Activate(__uuidof(IAudioMeterInformation),
+            CLSCTX_ALL, nullptr, (void**)&meter_);
+        if (FAILED(hr) || !meter_) {
+            if (enableDebug) std::cerr << "[WindowFocus] AudioMeterCache: Failed to activate meter" << std::endl;
+            Reset();
+            return false;
+        }
+
+        lastInitTime_ = std::chrono::steady_clock::now();
+        consecutiveFailures_ = 0;
+        return true;
+    }
+
+    void Reset() {
+        if (meter_) { try { meter_->Release(); } catch (...) {} meter_ = nullptr; }
+        if (device_) { try { device_->Release(); } catch (...) {} device_ = nullptr; }
+        if (enumerator_) { try { enumerator_->Release(); } catch (...) {} enumerator_ = nullptr; }
+        consecutiveFailures_ = 0;
+    }
+
+    AudioMeterCache(const AudioMeterCache&) = delete;
+    AudioMeterCache& operator=(const AudioMeterCache&) = delete;
+};
+
+// =====================================================================
 // PlatformTaskDispatcher
+// FIX: Added pending count to prevent message queue overflow
+// FIX: Added power resume notification support
 // =====================================================================
 class PlatformTaskDispatcher {
 public:
@@ -331,16 +399,29 @@ public:
                                0, 0, 0, 0, HWND_MESSAGE, nullptr,
                                GetModuleHandle(nullptr), nullptr);
         currentGeneration_++;
+
+        // FIX: Register for power resume notifications
+        if (hwnd_) {
+            powerNotifyHandle_ = RegisterSuspendResumeNotification(hwnd_, DEVICE_NOTIFY_WINDOW_HANDLE);
+        }
     }
 
     void Shutdown() {
         HWND hwndToDestroy = nullptr;
+        HPOWERNOTIFY powerNotify = nullptr;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!hwnd_) return;
             hwndToDestroy = hwnd_;
+            powerNotify = powerNotifyHandle_;
             hwnd_ = nullptr;
+            powerNotifyHandle_ = nullptr;
             currentGeneration_++;
+        }
+
+        // FIX: Unregister power notification
+        if (powerNotify) {
+            UnregisterSuspendResumeNotification(powerNotify);
         }
 
         MSG msg;
@@ -358,12 +439,24 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             hwnd = hwnd_;
             generation = currentGeneration_;
+
+            // FIX: Backpressure - drop tasks if queue is too deep
+            if (pendingCount_ > 500) {
+                return;
+            }
+            pendingCount_++;
         }
-        if (!hwnd) return;
+        if (!hwnd) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pendingCount_--;
+            return;
+        }
 
         auto* packet = new TaskPacket{ std::move(task), generation };
         if (!PostMessage(hwnd, WM_APP + 1, 0, reinterpret_cast<LPARAM>(packet))) {
             delete packet;
+            std::lock_guard<std::mutex> lock(mutex_);
+            pendingCount_--;
         }
     }
 
@@ -371,12 +464,23 @@ private:
     HWND hwnd_ = nullptr;
     std::mutex mutex_;
     std::atomic<uint64_t> currentGeneration_{ 0 };
+    int pendingCount_ = 0;  // Protected by mutex_
+    HPOWERNOTIFY powerNotifyHandle_ = nullptr;
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (msg == WM_APP + 1) {
             auto* packet = reinterpret_cast<TaskPacket*>(lParam);
             if (packet) {
-                uint64_t live = PlatformTaskDispatcher::Get().currentGeneration_.load();
+                auto& dispatcher = PlatformTaskDispatcher::Get();
+                uint64_t live = dispatcher.currentGeneration_.load();
+
+                {
+                    std::lock_guard<std::mutex> lock(dispatcher.mutex_);
+                    if (dispatcher.pendingCount_ > 0) {
+                        dispatcher.pendingCount_--;
+                    }
+                }
+
                 if (packet->generation == live) {
                     try { packet->fn(); } catch (...) {}
                 }
@@ -384,6 +488,22 @@ private:
             }
             return 0;
         }
+
+        // FIX: Handle power resume notifications
+        if (msg == WM_POWERBROADCAST) {
+            if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
+                std::shared_ptr<WindowFocusPlugin> inst;
+                {
+                    std::lock_guard<std::mutex> lock(WindowFocusPlugin::instanceMutex_);
+                    inst = WindowFocusPlugin::instance_.lock();
+                }
+                if (inst && !inst->IsShuttingDown()) {
+                    inst->OnSystemResume();
+                }
+            }
+            return TRUE;
+        }
+
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
 };
@@ -462,7 +582,6 @@ void WindowFocusPlugin::SetHooks() {
         std::cout << "[WindowFocus] SetHooks: start\n";
     }
 
-    // FIX: Remove any existing hooks first to prevent leaks on hot restart
     RemoveHooks();
 
     HINSTANCE hInstance = GetModuleHandle(nullptr);
@@ -500,6 +619,44 @@ void WindowFocusPlugin::RemoveHooks() {
 void WindowFocusPlugin::UpdateLastActivityTime() {
     std::lock_guard<std::mutex> lock(activityMutex_);
     lastActivityTime = std::chrono::steady_clock::now();
+}
+
+// FIX: Public accessor for shutdown state (used by PlatformTaskDispatcher)
+bool WindowFocusPlugin::IsShuttingDown() const {
+    return isShuttingDown_.load(std::memory_order_acquire);
+}
+
+// FIX: System resume handler - resets activity time and reinitializes devices
+void WindowFocusPlugin::OnSystemResume() {
+    if (isShuttingDown_.load(std::memory_order_acquire)) return;
+
+    if (enableDebug_.load(std::memory_order_relaxed)) {
+        std::cout << "[WindowFocus] System resume detected - resetting state" << std::endl;
+    }
+
+    // Reset activity time so we don't immediately trigger inactivity
+    UpdateLastActivityTime();
+
+    // Mark user as active since they just woke the machine
+    if (!userIsActive_.load(std::memory_order_acquire)) {
+        userIsActive_.store(true, std::memory_order_release);
+        std::weak_ptr<WindowFocusPlugin> weak;
+        {
+            std::lock_guard<std::mutex> lock(instanceMutex_);
+            weak = instance_;
+        }
+        PostToMainThread([weak]() {
+            if (auto p = weak.lock()) {
+                if (!p->isShuttingDown_.load(std::memory_order_acquire)) {
+                    p->SafeInvokeMethod("onUserActive", "User is active (system resume)");
+                }
+            }
+        });
+    }
+
+    // Signal that HID devices need reinit and audio cache needs refresh
+    needsHIDReinit_.store(true, std::memory_order_release);
+    needsAudioCacheReset_.store(true, std::memory_order_release);
 }
 
 void WindowFocusPlugin::PostToMainThread(std::function<void()> task) {
@@ -573,33 +730,36 @@ std::string ConvertWStringToUTF8(const std::wstring& wstr) {
 }
 
 // =====================================================================
-// FIX: Helper to join threads while pumping messages to avoid deadlock
+// FIX: Join threads with bounded timeout and message pumping
 // =====================================================================
 static void JoinThreadsWithMessagePump(std::vector<std::thread>& threads) {
     for (auto& t : threads) {
         if (!t.joinable()) continue;
 
-        // Try joining with a timeout loop, pumping messages to avoid deadlock
-        // if background threads are posting to the main thread
-        while (true) {
+        HANDLE h = t.native_handle();
+        bool threadExited = false;
+
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+
+        while (!threadExited && std::chrono::steady_clock::now() < deadline) {
             MSG msg;
             while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
                 TranslateMessage(&msg);
                 DispatchMessage(&msg);
             }
-
-            HANDLE h = t.native_handle();
             DWORD waitResult = WaitForSingleObject(h, 50);
-            if (waitResult == WAIT_OBJECT_0) {
+            if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_FAILED) {
+                threadExited = true;
+            }
+        }
+
+        if (t.joinable()) {
+            if (threadExited) {
                 t.join();
-                break;
+            } else {
+                // Last resort during system shutdown: detach rather than deadlock
+                t.detach();
             }
-            if (waitResult == WAIT_FAILED) {
-                // Handle is likely invalid; thread already exited
-                try { t.join(); } catch (...) {}
-                break;
-            }
-            // WAIT_TIMEOUT: continue pumping
         }
     }
     threads.clear();
@@ -648,6 +808,56 @@ void WindowFocusPlugin::RegisterWithRegistrar(
     registrar->AddPlugin(std::make_unique<SharedOwner>(plugin));
 }
 
+// FIX: Single function to get window info from an HWND, avoiding redundant calls
+struct WindowInfo {
+    std::string title;
+    std::string appName;
+};
+
+static WindowInfo GetWindowInfoFromHWND(HWND hwnd) {
+    WindowInfo info;
+
+    if (!hwnd) {
+        info.title = "";
+        info.appName = "<no window in focus>";
+        return info;
+    }
+
+    // Get title once
+    int titleLen = GetWindowTextLengthA(hwnd);
+    if (titleLen > 0) {
+        info.title.resize(titleLen + 1, '\0');
+        GetWindowTextA(hwnd, info.title.data(), titleLen + 1);
+        info.title.resize(titleLen);
+    }
+
+    // Get process name from the same HWND
+    DWORD processID = 0;
+    GetWindowThreadProcessId(hwnd, &processID);
+    if (processID > 0) {
+        std::wstring processName = L"<unknown>";
+        HANDLE hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hProcessSnap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe32;
+            pe32.dwSize = sizeof(PROCESSENTRY32W);
+            if (Process32FirstW(hProcessSnap, &pe32)) {
+                do {
+                    if (pe32.th32ProcessID == processID) {
+                        processName = pe32.szExeFile;
+                        break;
+                    }
+                } while (Process32NextW(hProcessSnap, &pe32));
+            }
+            CloseHandle(hProcessSnap);
+        }
+        info.appName = ConvertWStringToUTF8(processName);
+    } else {
+        info.appName = "<unknown>";
+    }
+
+    return info;
+}
+
 std::string GetFocusedWindowTitle() {
     HWND hwnd = GetForegroundWindow();
     if (hwnd == NULL) return "";
@@ -672,7 +882,9 @@ WindowFocusPlugin::WindowFocusPlugin()
     , hooksInstalled_(false)
     , inactivityThreshold_(300000)
     , audioThreshold_(0.01f)
-    , lastKeyEventTime_(0) {
+    , lastKeyEventTime_(0)
+    , needsHIDReinit_(false)
+    , needsAudioCacheReset_(false) {
 
     lastActivityTime = std::chrono::steady_clock::now();
     ZeroMemory(lastControllerStates_, sizeof(lastControllerStates_));
@@ -680,7 +892,6 @@ WindowFocusPlugin::WindowFocusPlugin()
 }
 
 WindowFocusPlugin::~WindowFocusPlugin() {
-    // Signal shutdown first
     isShuttingDown_.store(true, std::memory_order_release);
 
     {
@@ -692,19 +903,16 @@ WindowFocusPlugin::~WindowFocusPlugin() {
 
     RemoveHooks();
 
-    // Wake all threads so they can observe isShuttingDown_ and exit
     {
         std::lock_guard<std::mutex> lock(shutdownMutex_);
         shutdownCv_.notify_all();
     }
 
-    // FIX: Join threads while pumping messages to prevent deadlock
     {
         std::lock_guard<std::mutex> lock(threadsMutex_);
         JoinThreadsWithMessagePump(threads_);
     }
 
-    // Safe to close HID devices now — no threads are running
     CloseHIDDevices();
 
     PlatformTaskDispatcher::Get().Shutdown();
@@ -1028,22 +1236,35 @@ bool WindowFocusPlugin::CheckKeyboardInput() {
     return PollKeyboardState();
 }
 
+// FIX: CheckSystemAudio now uses cached audio meter via thread-local AudioMeterCache
 bool WindowFocusPlugin::CheckSystemAudio() {
     if (!monitorAudio_.load(std::memory_order_acquire) ||
         isShuttingDown_.load(std::memory_order_acquire)) {
         return false;
     }
 
-    float peakValue = 0.0f;
-    bool comError = false;
-    bool success = GetAudioPeakValueSEH(&peakValue, &comError);
+    // audioMeterCache_ is managed per-thread in MonitorAllInputDevices
+    // This method is only called from that thread, so access is safe
+    // The cache pointer is passed via the check method
+    // (We use the member pointer set by the monitor thread)
 
-    if (comError && enableDebug_.load(std::memory_order_relaxed)) {
-        std::cerr << "[WindowFocus] Exception in CheckSystemAudio" << std::endl;
+    float peakValue = 0.0f;
+    bool debug = enableDebug_.load(std::memory_order_relaxed);
+
+    {
+        std::lock_guard<std::mutex> lock(audioMeterMutex_);
+        if (!audioMeterCache_) return false;
+
+        // Check if system resume requested a cache reset
+        if (needsAudioCacheReset_.exchange(false, std::memory_order_acq_rel)) {
+            audioMeterCache_->Invalidate();
+        }
+
+        peakValue = audioMeterCache_->GetPeak(debug);
     }
 
-    if (success && peakValue > audioThreshold_.load(std::memory_order_acquire)) {
-        if (enableDebug_.load(std::memory_order_relaxed)) {
+    if (peakValue > audioThreshold_.load(std::memory_order_acquire)) {
+        if (debug) {
             std::cout << "[WindowFocus] Audio detected, peak: " << peakValue << std::endl;
         }
         return true;
@@ -1160,10 +1381,6 @@ void WindowFocusPlugin::InitializeHIDDevices() {
     }
 }
 
-// =====================================================================
-// FIX: Restructured CheckHIDDevices to prevent double-close and
-// ensure OverlappedGuards are destroyed before handles are closed
-// =====================================================================
 bool WindowFocusPlugin::CheckHIDDevices() {
     if (!monitorHIDDevices_.load(std::memory_order_acquire) ||
         isShuttingDown_.load(std::memory_order_acquire)) {
@@ -1192,8 +1409,6 @@ bool WindowFocusPlugin::CheckHIDDevices() {
 
         std::vector<BYTE> buffer(lastState.size(), 0);
 
-        // FIX: OverlappedGuard is scoped so it is ALWAYS destroyed before
-        // we touch the handles in the cleanup section below
         {
             OverlappedGuard ovlGuard(deviceHandle);
             if (!ovlGuard.IsValid()) {
@@ -1239,7 +1454,6 @@ bool WindowFocusPlugin::CheckHIDDevices() {
                         }
                     } else if (overlappedError == ERROR_INVALID_HANDLE ||
                                overlappedError == ERROR_DEVICE_NOT_CONNECTED) {
-                        // FIX: Invalidate device in guard before marking for removal
                         ovlGuard.InvalidateDevice();
                         ovlGuard.MarkComplete();
                         invalidDevices.push_back(i);
@@ -1253,12 +1467,10 @@ bool WindowFocusPlugin::CheckHIDDevices() {
                     ovlGuard.MarkComplete();
                     invalidDevices.push_back(i);
                 }
-                // WAIT_TIMEOUT: OverlappedGuard destructor handles CancelIo + bounded wait
             } else if (errorCode == ERROR_DEVICE_NOT_CONNECTED ||
                        errorCode == ERROR_GEN_FAILURE ||
                        errorCode == ERROR_INVALID_HANDLE ||
                        errorCode == ERROR_BAD_DEVICE) {
-                // FIX: Invalidate device in guard so destructor doesn't CancelIo on it
                 ovlGuard.InvalidateDevice();
                 ovlGuard.MarkComplete();
                 if (enableDebug_.load(std::memory_order_relaxed)) {
@@ -1276,15 +1488,13 @@ bool WindowFocusPlugin::CheckHIDDevices() {
                 }
                 invalidDevices.push_back(i);
             }
-        } // OverlappedGuard is destroyed here — BEFORE we close handles below
+        } // OverlappedGuard destroyed here
 
         if (inputDetected) break;
     }
 
-    // Remove invalid devices in reverse order
-    // FIX: All OverlappedGuards are guaranteed destroyed at this point
     if (!invalidDevices.empty()) {
-        std::sort(invalidDevices.begin(), invalidDevices.end());
+                std::sort(invalidDevices.begin(), invalidDevices.end());
         invalidDevices.erase(std::unique(invalidDevices.begin(), invalidDevices.end()),
                              invalidDevices.end());
 
@@ -1336,15 +1546,29 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
 
     std::lock_guard<std::mutex> tlock(threadsMutex_);
     threads_.emplace_back([weak]() {
-        // FIX: Only uninitialize COM if we actually initialized it
+        // COM initialization owned by this thread
         bool comInitialized = false;
         {
             HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-            comInitialized = SUCCEEDED(hr); // FIX: Don't count RPC_E_CHANGED_MODE
+            comInitialized = SUCCEEDED(hr);
+        }
+
+        // FIX: Create thread-local audio meter cache and register it with the plugin
+        auto audioCache = std::make_unique<AudioMeterCache>();
+        {
+            auto self = weak.lock();
+            if (self) {
+                std::lock_guard<std::mutex> lock(self->audioMeterMutex_);
+                self->audioMeterCache_ = audioCache.get();
+            }
         }
 
         auto lastHIDReinit = std::chrono::steady_clock::now();
         const auto hidReinitInterval = std::chrono::seconds(30);
+
+        // FIX: Periodic full HID refresh to clear stale handles
+        auto lastFullHIDRefresh = std::chrono::steady_clock::now();
+        const auto fullHIDRefreshInterval = std::chrono::minutes(5);
 
         while (true) {
             auto self = weak.lock();
@@ -1358,6 +1582,7 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
                 }
             }
 
+            // Re-check after waking
             self = weak.lock();
             if (!self || self->isShuttingDown_.load(std::memory_order_acquire)) break;
 
@@ -1381,9 +1606,26 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
                 }
             }
 
+            // FIX: Handle system resume signal for HID reinit
+            if (self->needsHIDReinit_.exchange(false, std::memory_order_acq_rel)) {
+                if (self->monitorHIDDevices_.load(std::memory_order_acquire) &&
+                    !self->isShuttingDown_.load(std::memory_order_acquire)) {
+                    if (self->enableDebug_.load(std::memory_order_relaxed)) {
+                        std::cout << "[WindowFocus] System resume: reinitializing HID devices" << std::endl;
+                    }
+                    self->CloseHIDDevices();
+                    self->InitializeHIDDevices();
+                    lastHIDReinit = std::chrono::steady_clock::now();
+                    lastFullHIDRefresh = std::chrono::steady_clock::now();
+                }
+            }
+
+            // Periodic HID re-initialization (when list is empty)
             if (self->monitorHIDDevices_.load(std::memory_order_acquire) &&
                 !self->isShuttingDown_.load(std::memory_order_acquire)) {
                 auto now = std::chrono::steady_clock::now();
+
+                // Quick reinit if all devices disappeared
                 if (now - lastHIDReinit > hidReinitInterval) {
                     lastHIDReinit = now;
                     bool needsReinit = false;
@@ -1393,8 +1635,20 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
                     }
                     if (needsReinit && !self->isShuttingDown_.load(std::memory_order_acquire)) {
                         if (self->enableDebug_.load(std::memory_order_relaxed)) {
-                            std::cout << "[WindowFocus] Re-initializing HID devices" << std::endl;
+                            std::cout << "[WindowFocus] Re-initializing HID devices (empty list)" << std::endl;
                         }
+                        self->InitializeHIDDevices();
+                    }
+                }
+
+                // FIX: Full refresh to clear stale handles that passed IsHandleValid
+                if (now - lastFullHIDRefresh > fullHIDRefreshInterval) {
+                    lastFullHIDRefresh = now;
+                    if (!self->isShuttingDown_.load(std::memory_order_acquire)) {
+                        if (self->enableDebug_.load(std::memory_order_relaxed)) {
+                            std::cout << "[WindowFocus] Periodic full HID device refresh" << std::endl;
+                        }
+                        self->CloseHIDDevices();
                         self->InitializeHIDDevices();
                     }
                 }
@@ -1415,9 +1669,19 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
                 }
             }
 
-            // FIX: Release self before sleeping to avoid preventing destruction
+            // Release self before sleeping to avoid preventing destruction
             self.reset();
         }
+
+        // FIX: Unregister audio cache before thread exits
+        {
+            auto self = weak.lock();
+            if (self) {
+                std::lock_guard<std::mutex> lock(self->audioMeterMutex_);
+                self->audioMeterCache_ = nullptr;
+            }
+        }
+        audioCache.reset();
 
         if (comInitialized) {
             CoUninitialize();
@@ -1471,7 +1735,7 @@ void WindowFocusPlugin::CheckForInactivity() {
                 });
             }
 
-            // FIX: Release self before sleeping to avoid preventing destruction
+            // Release self before sleeping to avoid preventing destruction
             self.reset();
         }
     });
@@ -1484,6 +1748,10 @@ void WindowFocusPlugin::StartFocusListener() {
     threads_.emplace_back([weak]() {
         HWND last_focused = nullptr;
 
+        // FIX: Debounce timer for focus changes
+        auto lastFocusEventTime = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        const auto focusDebounceInterval = std::chrono::milliseconds(250);
+
         while (true) {
             auto self = weak.lock();
             if (!self || self->isShuttingDown_.load(std::memory_order_acquire)) break;
@@ -1493,31 +1761,27 @@ void WindowFocusPlugin::StartFocusListener() {
                 if (current_focused != last_focused) {
                     last_focused = current_focused;
 
-                    if (current_focused != nullptr) {
-                        int titleLen = GetWindowTextLengthA(current_focused);
-                        std::string window_title;
-                        if (titleLen > 0) {
-                            window_title.resize(titleLen + 1, '\0');
-                            GetWindowTextA(current_focused, window_title.data(), titleLen + 1);
-                            window_title.resize(titleLen);
-                        }
+                    // FIX: Debounce rapid focus changes
+                    auto now = std::chrono::steady_clock::now();
+                    if (now - lastFocusEventTime < focusDebounceInterval) {
+                        // Skip this event - too soon after the last one
+                    } else if (current_focused != nullptr) {
+                        lastFocusEventTime = now;
 
-                        std::string appName = GetFocusedWindowAppName();
-                        std::string windowTitle = GetFocusedWindowTitle();
+                        // FIX: Get all window info from single HWND in one call
+                        WindowInfo winfo = GetWindowInfoFromHWND(current_focused);
 
                         if (self->enableDebug_.load(std::memory_order_relaxed)) {
-                            std::cout << "Current window title: " << window_title << std::endl;
-                            std::cout << "Current window name: " << windowTitle << std::endl;
-                            std::cout << "Current window appName: " << appName << std::endl;
+                            std::cout << "Current window title: " << winfo.title << std::endl;
+                            std::cout << "Current window appName: " << winfo.appName << std::endl;
                         }
 
-                        std::string utf8_output = ConvertToUTF8(window_title);
-                        std::string utf8_windowTitle = ConvertToUTF8(windowTitle);
+                        std::string utf8_title = ConvertToUTF8(winfo.title);
 
                         flutter::EncodableMap data;
-                        data[flutter::EncodableValue("title")]       = flutter::EncodableValue(utf8_output);
-                        data[flutter::EncodableValue("appName")]     = flutter::EncodableValue(appName);
-                        data[flutter::EncodableValue("windowTitle")] = flutter::EncodableValue(utf8_windowTitle);
+                        data[flutter::EncodableValue("title")]       = flutter::EncodableValue(utf8_title);
+                        data[flutter::EncodableValue("appName")]     = flutter::EncodableValue(winfo.appName);
+                        data[flutter::EncodableValue("windowTitle")] = flutter::EncodableValue(utf8_title);
 
                         if (!self->isShuttingDown_.load(std::memory_order_acquire)) {
                             self->PostToMainThread([weak, d = std::move(data)]() mutable {
@@ -1537,10 +1801,9 @@ void WindowFocusPlugin::StartFocusListener() {
                 }
             }
 
-            // FIX: Release self before sleeping to avoid preventing destruction
+            // Release self before sleeping to avoid preventing destruction
             self.reset();
 
-            // Re-lock to check shutdown and sleep
             {
                 auto self2 = weak.lock();
                 if (!self2 || self2->isShuttingDown_.load(std::memory_order_acquire)) break;
@@ -1576,6 +1839,7 @@ private:
     }
 };
 
+// FIX: Screenshot with proper encoder validation and RAII for GDI+ objects
 std::optional<std::vector<uint8_t>> WindowFocusPlugin::TakeScreenshot(bool activeWindowOnly) {
     std::lock_guard<std::mutex> lock(screenshotMutex_);
 
@@ -1611,39 +1875,57 @@ std::optional<std::vector<uint8_t>> WindowFocusPlugin::TakeScreenshot(bool activ
     BitBlt(hdcMemDC, 0, 0, width, height, hdcScreen, rc.left, rc.top, SRCCOPY);
     SelectObject(hdcMemDC, oldBitmap);
 
-    Gdiplus::Bitmap* bitmap = new Gdiplus::Bitmap(hbmScreen, NULL);
-    if (!bitmap) return std::nullopt;
-
-    IStream* stream = nullptr;
-    HRESULT hr = CreateStreamOnHGlobal(NULL, TRUE, &stream);
-
-    if (FAILED(hr) || !stream) {
-        delete bitmap;
+    // FIX: Use unique_ptr for Gdiplus::Bitmap (new can't return nullptr, check status instead)
+    auto bitmap = std::make_unique<Gdiplus::Bitmap>(hbmScreen, nullptr);
+    if (bitmap->GetLastStatus() != Gdiplus::Ok) {
         return std::nullopt;
     }
 
+    // FIX: Validate encoder CLSID before using it
     CLSID pngClsid;
-    GetEncoderClsid(L"image/png", &pngClsid);
-    bitmap->Save(stream, &pngClsid, NULL);
+    if (GetEncoderClsid(L"image/png", &pngClsid) < 0) {
+        if (enableDebug_.load(std::memory_order_relaxed)) {
+            std::cerr << "[WindowFocus] PNG encoder not found" << std::endl;
+        }
+        return std::nullopt;
+    }
+
+    IStream* stream = nullptr;
+    HRESULT hr = CreateStreamOnHGlobal(NULL, TRUE, &stream);
+    if (FAILED(hr) || !stream) {
+        return std::nullopt;
+    }
+
+    // FIX: Check Save return value
+    Gdiplus::Status saveStatus = bitmap->Save(stream, &pngClsid, NULL);
+    if (saveStatus != Gdiplus::Ok) {
+        stream->Release();
+        if (enableDebug_.load(std::memory_order_relaxed)) {
+            std::cerr << "[WindowFocus] Bitmap::Save failed with status " << saveStatus << std::endl;
+        }
+        return std::nullopt;
+    }
 
     STATSTG statstg;
-    stream->Stat(&statstg, STATFLAG_DEFAULT);
-    ULONG fileSize = (ULONG)statstg.cbSize.QuadPart;
+    hr = stream->Stat(&statstg, STATFLAG_DEFAULT);
+    if (FAILED(hr)) {
+        stream->Release();
+        return std::nullopt;
+    }
 
+    ULONG fileSize = (ULONG)statstg.cbSize.QuadPart;
     if (fileSize == 0) {
         stream->Release();
-        delete bitmap;
         return std::nullopt;
     }
 
     std::vector<uint8_t> data(fileSize);
-    LARGE_INTEGER liZero = { 0 };
+    LARGE_INTEGER liZero = {};
     stream->Seek(liZero, STREAM_SEEK_SET, NULL);
     ULONG bytesRead = 0;
     stream->Read(data.data(), fileSize, &bytesRead);
 
     stream->Release();
-    delete bitmap;
 
     if (bytesRead > 0) {
         return data;
