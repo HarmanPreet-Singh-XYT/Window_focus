@@ -54,11 +54,6 @@ using CallbackMethod = std::function<void(const std::wstring&)>;
 
 // =====================================================================
 // SEH-isolated helper functions
-//
-// WARNING: These functions use SEH (__try/__except). Do NOT place C++
-// objects with destructors (std::string, std::vector, RAII wrappers,
-// etc.) inside __try blocks — mixing SEH with C++ destructors is
-// undefined behaviour under MSVC.
 // =====================================================================
 
 static bool ReadHIDDeviceSEH(HANDLE deviceHandle, BYTE* buffer, DWORD bufferSize,
@@ -237,6 +232,8 @@ static bool CheckKeyStateSEH(int vKey, bool* exceptionOccurred) {
 
 // =====================================================================
 // RAII helper for overlapped HID reads
+// FIX: Bounded timeout instead of INFINITE
+// FIX: Validates handle before CancelIo
 // =====================================================================
 struct OverlappedGuard {
     OVERLAPPED ovl{};
@@ -251,14 +248,15 @@ struct OverlappedGuard {
         }
     }
 
-    // Increase wait or make it infinite after CancelIo
     ~OverlappedGuard() {
-        if (!completed && deviceHandle != INVALID_HANDLE_VALUE) {
+        // FIX: Check handle validity before CancelIo to avoid operating on closed handles
+        if (!completed && deviceHandle != INVALID_HANDLE_VALUE && IsHandleValid(deviceHandle)) {
             CancelIoSEH(deviceHandle);
         }
         if (hEvent) {
             if (!completed) {
-                WaitForSingleObject(hEvent, INFINITE); // CancelIo guarantees completion
+                // FIX: Bounded wait instead of INFINITE to prevent hangs
+                WaitForSingleObject(hEvent, 3000);
             }
             CloseHandleSEH(hEvent);
         }
@@ -267,6 +265,9 @@ struct OverlappedGuard {
     bool IsValid() const { return hEvent != nullptr; }
     void MarkComplete() { completed = true; }
     OVERLAPPED* Get() { return &ovl; }
+
+    // FIX: Invalidate the device handle so destructor won't CancelIo on a closed handle
+    void InvalidateDevice() { deviceHandle = INVALID_HANDLE_VALUE; }
 
     OverlappedGuard(const OverlappedGuard&) = delete;
     OverlappedGuard& operator=(const OverlappedGuard&) = delete;
@@ -460,6 +461,10 @@ void WindowFocusPlugin::SetHooks() {
     if (enableDebug_.load(std::memory_order_relaxed)) {
         std::cout << "[WindowFocus] SetHooks: start\n";
     }
+
+    // FIX: Remove any existing hooks first to prevent leaks on hot restart
+    RemoveHooks();
+
     HINSTANCE hInstance = GetModuleHandle(nullptr);
 
     mouseHook_ = SetWindowsHookEx(WH_MOUSE_LL, MouseProc, hInstance, 0);
@@ -567,6 +572,39 @@ std::string ConvertWStringToUTF8(const std::wstring& wstr) {
     return strTo;
 }
 
+// =====================================================================
+// FIX: Helper to join threads while pumping messages to avoid deadlock
+// =====================================================================
+static void JoinThreadsWithMessagePump(std::vector<std::thread>& threads) {
+    for (auto& t : threads) {
+        if (!t.joinable()) continue;
+
+        // Try joining with a timeout loop, pumping messages to avoid deadlock
+        // if background threads are posting to the main thread
+        while (true) {
+            MSG msg;
+            while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+
+            HANDLE h = t.native_handle();
+            DWORD waitResult = WaitForSingleObject(h, 50);
+            if (waitResult == WAIT_OBJECT_0) {
+                t.join();
+                break;
+            }
+            if (waitResult == WAIT_FAILED) {
+                // Handle is likely invalid; thread already exited
+                try { t.join(); } catch (...) {}
+                break;
+            }
+            // WAIT_TIMEOUT: continue pumping
+        }
+    }
+    threads.clear();
+}
+
 // static
 void WindowFocusPlugin::RegisterWithRegistrar(
     flutter::PluginRegistrarWindows* registrar) {
@@ -660,15 +698,10 @@ WindowFocusPlugin::~WindowFocusPlugin() {
         shutdownCv_.notify_all();
     }
 
-    // Join all threads before destroying any state they may reference
+    // FIX: Join threads while pumping messages to prevent deadlock
     {
         std::lock_guard<std::mutex> lock(threadsMutex_);
-        for (auto& t : threads_) {
-            if (t.joinable()) {
-                t.join();
-            }
-        }
-        threads_.clear();
+        JoinThreadsWithMessagePump(threads_);
     }
 
     // Safe to close HID devices now — no threads are running
@@ -927,36 +960,28 @@ bool WindowFocusPlugin::CheckRawInput() {
 }
 
 bool WindowFocusPlugin::PollKeyboardState() {
-    // NOTE: This is a fallback used only when hooks are not installed.
-    // GetAsyncKeyState can report keys consumed by other applications,
-    // and polling ~80+ keys each cycle is inherently expensive compared
-    // to the hook-based path.
     if (isShuttingDown_.load(std::memory_order_acquire)) return false;
 
     bool exceptionOccurred = false;
 
-    // Letters A-Z
     for (int vk = 0x41; vk <= 0x5A; vk++) {
         if (isShuttingDown_.load(std::memory_order_acquire)) return false;
         if (CheckKeyStateSEH(vk, &exceptionOccurred) && !exceptionOccurred) return true;
         if (exceptionOccurred) return false;
     }
 
-    // Numbers 0-9
     for (int vk = 0x30; vk <= 0x39; vk++) {
         if (isShuttingDown_.load(std::memory_order_acquire)) return false;
         if (CheckKeyStateSEH(vk, &exceptionOccurred) && !exceptionOccurred) return true;
         if (exceptionOccurred) return false;
     }
 
-    // Function keys
     for (int vk = VK_F1; vk <= VK_F12; vk++) {
         if (isShuttingDown_.load(std::memory_order_acquire)) return false;
         if (CheckKeyStateSEH(vk, &exceptionOccurred) && !exceptionOccurred) return true;
         if (exceptionOccurred) return false;
     }
 
-    // Special keys
     static const int specialKeys[] = {
         VK_SPACE, VK_RETURN, VK_TAB, VK_ESCAPE, VK_BACK, VK_DELETE,
         VK_SHIFT, VK_CONTROL, VK_MENU,
@@ -988,7 +1013,6 @@ bool WindowFocusPlugin::CheckKeyboardInput() {
         return false;
     }
 
-    // If hooks are active, check the hook timestamp — no need to poll
     if (hooksInstalled_.load(std::memory_order_acquire)) {
         auto now = std::chrono::steady_clock::now();
         uint64_t currentTime = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1001,7 +1025,6 @@ bool WindowFocusPlugin::CheckKeyboardInput() {
         return false;
     }
 
-    // Hooks not installed — fall back to polling
     return PollKeyboardState();
 }
 
@@ -1137,6 +1160,10 @@ void WindowFocusPlugin::InitializeHIDDevices() {
     }
 }
 
+// =====================================================================
+// FIX: Restructured CheckHIDDevices to prevent double-close and
+// ensure OverlappedGuards are destroyed before handles are closed
+// =====================================================================
 bool WindowFocusPlugin::CheckHIDDevices() {
     if (!monitorHIDDevices_.load(std::memory_order_acquire) ||
         isShuttingDown_.load(std::memory_order_acquire)) {
@@ -1165,84 +1192,97 @@ bool WindowFocusPlugin::CheckHIDDevices() {
 
         std::vector<BYTE> buffer(lastState.size(), 0);
 
-        OverlappedGuard ovlGuard(deviceHandle);
-        if (!ovlGuard.IsValid()) {
-            if (enableDebug_.load(std::memory_order_relaxed)) {
-                std::cerr << "[WindowFocus] Failed to create event for HID device "
-                          << i << std::endl;
-            }
-            continue;
-        }
-
-        DWORD bytesRead = 0;
-        DWORD bufferSize = static_cast<DWORD>(buffer.size());
-        DWORD errorCode = 0;
-
-        bool readSucceeded = ReadHIDDeviceSEH(
-            deviceHandle, buffer.data(), bufferSize,
-            ovlGuard.Get(), &bytesRead, &errorCode);
-
-        if (readSucceeded) {
-            ovlGuard.MarkComplete();
-            if (bytesRead > 0 && buffer != lastState) {
-                inputDetected = true;
-                lastState = buffer;
+        // FIX: OverlappedGuard is scoped so it is ALWAYS destroyed before
+        // we touch the handles in the cleanup section below
+        {
+            OverlappedGuard ovlGuard(deviceHandle);
+            if (!ovlGuard.IsValid()) {
                 if (enableDebug_.load(std::memory_order_relaxed)) {
-                    std::cout << "[WindowFocus] HID device " << i
-                              << " input detected" << std::endl;
+                    std::cerr << "[WindowFocus] Failed to create event for HID device "
+                              << i << std::endl;
                 }
+                continue;
             }
-        } else if (errorCode == ERROR_IO_PENDING) {
-            DWORD waitResult = WaitForSingleObject(ovlGuard.ovl.hEvent, 10);
-            if (waitResult == WAIT_OBJECT_0) {
+
+            DWORD bytesRead = 0;
+            DWORD bufferSize = static_cast<DWORD>(buffer.size());
+            DWORD errorCode = 0;
+
+            bool readSucceeded = ReadHIDDeviceSEH(
+                deviceHandle, buffer.data(), bufferSize,
+                ovlGuard.Get(), &bytesRead, &errorCode);
+
+            if (readSucceeded) {
                 ovlGuard.MarkComplete();
-                DWORD overlappedError = 0;
-                if (GetOverlappedResultSEH(deviceHandle, ovlGuard.Get(),
-                                            &bytesRead, &overlappedError)) {
-                    if (bytesRead > 0 && buffer != lastState) {
-                        inputDetected = true;
-                        lastState = buffer;
-                        if (enableDebug_.load(std::memory_order_relaxed)) {
-                            std::cout << "[WindowFocus] HID device " << i
-                                      << " input (overlapped)" << std::endl;
-                        }
+                if (bytesRead > 0 && buffer != lastState) {
+                    inputDetected = true;
+                    lastState = buffer;
+                    if (enableDebug_.load(std::memory_order_relaxed)) {
+                        std::cout << "[WindowFocus] HID device " << i
+                                  << " input detected" << std::endl;
                     }
-                } else if (overlappedError == ERROR_INVALID_HANDLE ||
-                           overlappedError == ERROR_DEVICE_NOT_CONNECTED) {
+                }
+            } else if (errorCode == ERROR_IO_PENDING) {
+                DWORD waitResult = WaitForSingleObject(ovlGuard.ovl.hEvent, 10);
+                if (waitResult == WAIT_OBJECT_0) {
+                    ovlGuard.MarkComplete();
+                    DWORD overlappedError = 0;
+                    if (GetOverlappedResultSEH(deviceHandle, ovlGuard.Get(),
+                                                &bytesRead, &overlappedError)) {
+                        if (bytesRead > 0 && buffer != lastState) {
+                            inputDetected = true;
+                            lastState = buffer;
+                            if (enableDebug_.load(std::memory_order_relaxed)) {
+                                std::cout << "[WindowFocus] HID device " << i
+                                          << " input (overlapped)" << std::endl;
+                            }
+                        }
+                    } else if (overlappedError == ERROR_INVALID_HANDLE ||
+                               overlappedError == ERROR_DEVICE_NOT_CONNECTED) {
+                        // FIX: Invalidate device in guard before marking for removal
+                        ovlGuard.InvalidateDevice();
+                        ovlGuard.MarkComplete();
+                        invalidDevices.push_back(i);
+                    }
+                } else if (waitResult == WAIT_FAILED) {
+                    if (enableDebug_.load(std::memory_order_relaxed)) {
+                        std::cerr << "[WindowFocus] HID device " << i
+                                  << " wait failed: " << GetLastError() << std::endl;
+                    }
+                    ovlGuard.InvalidateDevice();
+                    ovlGuard.MarkComplete();
                     invalidDevices.push_back(i);
                 }
-            } else if (waitResult == WAIT_FAILED) {
+                // WAIT_TIMEOUT: OverlappedGuard destructor handles CancelIo + bounded wait
+            } else if (errorCode == ERROR_DEVICE_NOT_CONNECTED ||
+                       errorCode == ERROR_GEN_FAILURE ||
+                       errorCode == ERROR_INVALID_HANDLE ||
+                       errorCode == ERROR_BAD_DEVICE) {
+                // FIX: Invalidate device in guard so destructor doesn't CancelIo on it
+                ovlGuard.InvalidateDevice();
+                ovlGuard.MarkComplete();
                 if (enableDebug_.load(std::memory_order_relaxed)) {
-                    std::cerr << "[WindowFocus] HID device " << i
-                              << " wait failed: " << GetLastError() << std::endl;
+                    std::cout << "[WindowFocus] HID device " << i
+                              << " disconnected (error: " << errorCode << ")" << std::endl;
+                }
+                invalidDevices.push_back(i);
+            } else {
+                ovlGuard.InvalidateDevice();
+                ovlGuard.MarkComplete();
+                if (enableDebug_.load(std::memory_order_relaxed)) {
+                    std::cerr << "[WindowFocus] Error reading HID device " << i
+                              << " (code: 0x" << std::hex << errorCode << std::dec
+                              << ")" << std::endl;
                 }
                 invalidDevices.push_back(i);
             }
-            // WAIT_TIMEOUT: OverlappedGuard destructor handles CancelIo + wait
-        } else if (errorCode == ERROR_DEVICE_NOT_CONNECTED ||
-                   errorCode == ERROR_GEN_FAILURE ||
-                   errorCode == ERROR_INVALID_HANDLE ||
-                   errorCode == ERROR_BAD_DEVICE) {
-            ovlGuard.MarkComplete();
-            if (enableDebug_.load(std::memory_order_relaxed)) {
-                std::cout << "[WindowFocus] HID device " << i
-                          << " disconnected (error: " << errorCode << ")" << std::endl;
-            }
-            invalidDevices.push_back(i);
-        } else {
-            ovlGuard.MarkComplete();
-            if (enableDebug_.load(std::memory_order_relaxed)) {
-                std::cerr << "[WindowFocus] Error reading HID device " << i
-                          << " (code: 0x" << std::hex << errorCode << std::dec
-                          << ")" << std::endl;
-            }
-            invalidDevices.push_back(i);
-        }
+        } // OverlappedGuard is destroyed here — BEFORE we close handles below
 
         if (inputDetected) break;
     }
 
     // Remove invalid devices in reverse order
+    // FIX: All OverlappedGuards are guaranteed destroyed at this point
     if (!invalidDevices.empty()) {
         std::sort(invalidDevices.begin(), invalidDevices.end());
         invalidDevices.erase(std::unique(invalidDevices.begin(), invalidDevices.end()),
@@ -1292,16 +1332,15 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
         InitializeHIDDevices();
     }
 
-    // Capture weak_ptr so the thread never prevents destruction
     std::weak_ptr<WindowFocusPlugin> weak = shared_from_this();
 
     std::lock_guard<std::mutex> tlock(threadsMutex_);
     threads_.emplace_back([weak]() {
-        // COM initialization owned by this thread
+        // FIX: Only uninitialize COM if we actually initialized it
         bool comInitialized = false;
         {
             HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-            comInitialized = SUCCEEDED(hr) || (hr == RPC_E_CHANGED_MODE);
+            comInitialized = SUCCEEDED(hr); // FIX: Don't count RPC_E_CHANGED_MODE
         }
 
         auto lastHIDReinit = std::chrono::steady_clock::now();
@@ -1319,7 +1358,6 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
                 }
             }
 
-            // Re-check after waking
             self = weak.lock();
             if (!self || self->isShuttingDown_.load(std::memory_order_acquire)) break;
 
@@ -1343,7 +1381,6 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
                 }
             }
 
-            // Periodic HID re-initialization
             if (self->monitorHIDDevices_.load(std::memory_order_acquire) &&
                 !self->isShuttingDown_.load(std::memory_order_acquire)) {
                 auto now = std::chrono::steady_clock::now();
@@ -1377,6 +1414,9 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
                     });
                 }
             }
+
+            // FIX: Release self before sleeping to avoid preventing destruction
+            self.reset();
         }
 
         if (comInitialized) {
@@ -1430,6 +1470,9 @@ void WindowFocusPlugin::CheckForInactivity() {
                     }
                 });
             }
+
+            // FIX: Release self before sleeping to avoid preventing destruction
+            self.reset();
         }
     });
 }
@@ -1456,7 +1499,7 @@ void WindowFocusPlugin::StartFocusListener() {
                         if (titleLen > 0) {
                             window_title.resize(titleLen + 1, '\0');
                             GetWindowTextA(current_focused, window_title.data(), titleLen + 1);
-                                                        window_title.resize(titleLen);
+                            window_title.resize(titleLen);
                         }
 
                         std::string appName = GetFocusedWindowAppName();
@@ -1493,6 +1536,9 @@ void WindowFocusPlugin::StartFocusListener() {
                     std::cerr << "[WindowFocus] Exception in StartFocusListener loop" << std::endl;
                 }
             }
+
+            // FIX: Release self before sleeping to avoid preventing destruction
+            self.reset();
 
             // Re-lock to check shutdown and sleep
             {
@@ -1583,6 +1629,12 @@ std::optional<std::vector<uint8_t>> WindowFocusPlugin::TakeScreenshot(bool activ
     STATSTG statstg;
     stream->Stat(&statstg, STATFLAG_DEFAULT);
     ULONG fileSize = (ULONG)statstg.cbSize.QuadPart;
+
+    if (fileSize == 0) {
+        stream->Release();
+        delete bitmap;
+        return std::nullopt;
+    }
 
     std::vector<uint8_t> data(fileSize);
     LARGE_INTEGER liZero = { 0 };
