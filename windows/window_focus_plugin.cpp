@@ -903,24 +903,31 @@ WindowFocusPlugin::~WindowFocusPlugin() {
 
     RemoveHooks();
 
+    // Null the channel first so SafeInvokeMethod early-exits on isShuttingDown_
+    // before any in-flight dispatched tasks can reach it.
+    {
+        std::lock_guard<std::mutex> lock(channelMutex_);
+        channel = nullptr;
+    }
+
     {
         std::lock_guard<std::mutex> lock(shutdownMutex_);
         shutdownCv_.notify_all();
     }
 
+    // Move threads out of the vector before joining so threadsMutex_ is not
+    // held during the join — threads that are still starting up also acquire
+    // threadsMutex_, which would otherwise deadlock here.
+    std::vector<std::thread> threadsToJoin;
     {
         std::lock_guard<std::mutex> lock(threadsMutex_);
-        JoinThreadsWithMessagePump(threads_);
+        threadsToJoin = std::move(threads_);
     }
+    JoinThreadsWithMessagePump(threadsToJoin);
 
     CloseHIDDevices();
 
     PlatformTaskDispatcher::Get().Shutdown();
-
-    {
-        std::lock_guard<std::mutex> lock(channelMutex_);
-        channel = nullptr;
-    }
 }
 
 void WindowFocusPlugin::HandleMethodCall(
@@ -1576,7 +1583,7 @@ void WindowFocusPlugin::MonitorAllInputDevices() {
 
             {
                 std::unique_lock<std::mutex> lock(self->shutdownMutex_);
-                if (self->shutdownCv_.wait_for(lock, std::chrono::milliseconds(100),
+                if (self->shutdownCv_.wait_for(lock, std::chrono::milliseconds(500),
                     [&self] { return self->isShuttingDown_.load(std::memory_order_acquire); })) {
                     break;
                 }
@@ -1809,7 +1816,7 @@ void WindowFocusPlugin::StartFocusListener() {
                 if (!self2 || self2->isShuttingDown_.load(std::memory_order_acquire)) break;
 
                 std::unique_lock<std::mutex> lock(self2->shutdownMutex_);
-                if (self2->shutdownCv_.wait_for(lock, std::chrono::milliseconds(100),
+                if (self2->shutdownCv_.wait_for(lock, std::chrono::milliseconds(500),
                     [&self2] { return self2->isShuttingDown_.load(std::memory_order_acquire); })) {
                     break;
                 }
