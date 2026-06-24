@@ -102,6 +102,16 @@ class _MyAppState extends State<MyApp> {
   }
 
   Future<void> _checkPermissions() async {
+    if (!Platform.isMacOS) {
+      // Windows and other platforms don't have these permission concepts
+      setState(() {
+        _hasScreenRecordingPermission = true;
+        _hasInputMonitoringPermission = true;
+        _permissionsChecked = true;
+      });
+      return;
+    }
+
     final permissions = await _windowFocusPlugin.checkAllPermissions();
     setState(() {
       _hasScreenRecordingPermission = permissions.screenRecording;

@@ -108,6 +108,7 @@ pub fn handle(method: &str, args: Option<&EncodableValue>, sender: ResponseSende
             sender.success(EncodableValue::Null);
         }
 
+
         "takeScreenshot" => {
             sender.error("NOT_IMPLEMENTED", "Screenshot not supported in Rust port");
         }
