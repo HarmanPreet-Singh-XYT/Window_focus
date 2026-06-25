@@ -29,7 +29,7 @@ const TAG_INT64: u8 = 0x04;
 const TAG_FLOAT64: u8 = 0x06;
 const TAG_STRING: u8 = 0x07;
 const TAG_UINT8_LIST: u8 = 0x08;
-const TAG_MAP: u8 = 0x0C;
+const TAG_MAP: u8 = 0x0D;
 
 // ---- Size prefix encoding ----
 
@@ -215,7 +215,7 @@ pub fn decode_value(bytes: &[u8], pos: &mut usize) -> Option<EncodableValue> {
             *pos += byte_len;
             Some(EncodableValue::Null)
         }
-        0x0D => {
+        0x0E => {
             // float32 list
             let count = decode_size(bytes, pos)?;
             let byte_len = count * 4;

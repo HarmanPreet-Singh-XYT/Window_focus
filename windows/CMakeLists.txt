@@ -58,7 +58,8 @@ set_target_properties(${PLUGIN_NAME} PROPERTIES
 )
 add_dependencies(${PLUGIN_NAME} window_focus_rust_build)
 
-# Expose the include directory (empty but expected by Flutter tooling)
+# Expose the include directory containing the C API declaration the Rust
+# DLL exports, so the generated plugin registrant can call it.
 target_include_directories(${PLUGIN_NAME} INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
