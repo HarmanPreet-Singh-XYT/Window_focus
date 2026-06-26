@@ -56,13 +56,15 @@ impl MethodChannel {
         );
         unsafe {
             let locked = flutter_api::messenger_lock(self.messenger);
-            flutter_api::messenger_send(
-                locked,
-                self.channel_name.as_ptr(),
-                payload.as_ptr(),
-                payload.len(),
-            );
-            flutter_api::messenger_unlock(locked);
+            if !locked.is_null() {
+                flutter_api::messenger_send(
+                    locked,
+                    self.channel_name.as_ptr(),
+                    payload.as_ptr(),
+                    payload.len(),
+                );
+                flutter_api::messenger_unlock(locked);
+            }
         }
     }
 
@@ -85,13 +87,15 @@ impl MethodChannel {
 
         unsafe {
             let locked = flutter_api::messenger_lock(self.messenger);
-            flutter_api::messenger_send(
-                locked,
-                self.channel_name.as_ptr(),
-                payload.as_ptr(),
-                payload.len(),
-            );
-            flutter_api::messenger_unlock(locked);
+            if !locked.is_null() {
+                flutter_api::messenger_send(
+                    locked,
+                    self.channel_name.as_ptr(),
+                    payload.as_ptr(),
+                    payload.len(),
+                );
+                flutter_api::messenger_unlock(locked);
+            }
         }
     }
 
