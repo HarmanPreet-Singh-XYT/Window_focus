@@ -75,17 +75,29 @@ fn run(
 
         let title = get_window_title(hwnd);
         let app_name = get_app_name(hwnd);
+        let hwnd_str = hwnd_raw.to_string();
 
         if config.enable_debug.load(Ordering::Relaxed) {
-            eprintln!("[WindowFocus] title={:?} appName={:?}", title, app_name);
+            eprintln!(
+                "[WindowFocus] title={:?} appName={:?} hwnd={}",
+                title, app_name, hwnd_str
+            );
         }
 
+        // hwnd is included so the Dart side can resolve richer identity info
+        // (exe path, AUMID, etc.) against the EXACT window we observed here,
+        // rather than re-querying GetForegroundWindow() a moment later —
+        // which can race with focus changing again in between (e.g. a
+        // transient Search/Widgets overlay), causing the identity lookup to
+        // silently resolve a different window than the one that triggered
+        // this event.
         channel.invoke_method_map_locked(
             "onFocusChange",
             &[
                 ("title", title.as_str()),
                 ("appName", app_name.as_str()),
                 ("windowTitle", title.as_str()),
+                ("hwnd", hwnd_str.as_str()),
             ],
         );
     }

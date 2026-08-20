@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "locales": {
+    "es": {
+      "code": "es",
+      "status": "pending",
+      "excluded": false,
+      "added_at": "2026-07-01T00:36:41.799599Z",
+      "updated_at": "2026-07-01T00:36:41.799599Z"
+    },
+    "fr": {
+      "code": "fr",
+      "status": "pending",
+      "excluded": false,
+      "added_at": "2026-07-01T00:36:38.716556Z",
+      "updated_at": "2026-07-01T00:36:38.716556Z"
+    },
+    "pt-BR": {
+      "code": "pt-BR",
+      "status": "pending",
+      "excluded": false,
+      "added_at": "2026-07-01T00:36:43.916379Z",
+      "updated_at": "2026-07-01T00:36:43.916379Z"
+    }
+  }
+}

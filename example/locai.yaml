@@ -1,0 +1,13 @@
+source_locale: en
+target_locales: []
+llm_provider: claude
+translation_provider: llm
+arb_output: lib/l10n
+key_style: camelCase
+confidence_threshold: 0.85
+exclude_patterns:
+  - "^https?://"
+  - "^/"
+  - "^\d+$"
+  - "^[A-Z_]{2,}$"
+exclude_files: []

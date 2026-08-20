@@ -120,7 +120,9 @@ class WindowFocus {
       if (arguments is Map) {
         final String appName = arguments['appName']?.toString() ?? '';
         final String windowTitle = arguments['windowTitle']?.toString() ?? '';
-        final dto = AppWindowDto(appName: appName, windowTitle: windowTitle);
+        final int? hwnd = int.tryParse(arguments['hwnd']?.toString() ?? '');
+        final dto = AppWindowDto(
+            appName: appName, windowTitle: windowTitle, hwnd: hwnd);
 
         if (!_focusChangeController.isClosed) {
           _focusChangeController.add(dto);
